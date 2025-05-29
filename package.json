@@ -1,0 +1,20 @@
+{
+  "name": "marching-cubes-vite",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "build-wasm": "node build-wasm.cjs"
+  },
+  "devDependencies": {
+    "@types/gl-matrix": "^2.4.5",
+    "typescript": "~5.8.3",
+    "vite": "^6.3.5"
+  },
+  "dependencies": {
+    "gl-matrix": "^3.4.3"
+  }
+}
