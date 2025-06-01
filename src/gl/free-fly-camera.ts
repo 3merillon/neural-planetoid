@@ -1,6 +1,5 @@
 import { mat4, quat, vec3 } from "gl-matrix";
 
-// Utility: Quaternion "look rotation" (like Unity)
 function quatLookRotation(out: quat, fwd: vec3, up: vec3) {
     const z = vec3.negate(vec3.create(), fwd);
     vec3.normalize(z, z);
@@ -8,7 +7,6 @@ function quatLookRotation(out: quat, fwd: vec3, up: vec3) {
     vec3.normalize(x, x);
     const y = vec3.cross(vec3.create(), z, x);
     vec3.normalize(y, y);
-    // Column-major mat3
     const m = new Float32Array(9);
     m[0] = x[0]; m[1] = y[0]; m[2] = z[0];
     m[3] = x[1]; m[4] = y[1]; m[5] = z[1];
@@ -70,7 +68,7 @@ export class FreeFlyCamera {
     private smoothRollVelocity = 0;
     private targetRollDelta = 0;
 
-    private restrictToIsosurface = false;
+    private restrictToIsosurface = true;
     private densityAt: ((x: number, y: number, z: number) => number) | null = null;
     private isosurfaceBuffer: number = -1.0;
 
@@ -91,7 +89,6 @@ export class FreeFlyCamera {
 
         this.position = vec3.fromValues(...initialPos);
         this.orientation = quat.create();
-        // Set orientation to look at initialTarget
         const fwd = vec3.sub(vec3.create(), vec3.fromValues(...initialTarget), this.position);
         vec3.normalize(fwd, fwd);
         const up = vec3.fromValues(...initialUp);
@@ -102,7 +99,7 @@ export class FreeFlyCamera {
         this.updateViewMatrix();
 
         if (options) {
-            if (options.restrictToIsosurface) this.restrictToIsosurface = true;
+            if (options.restrictToIsosurface !== undefined) this.restrictToIsosurface = options.restrictToIsosurface;
             if (options.densityAt) this.densityAt = options.densityAt;
             if (options.isosurfaceBuffer !== undefined) this.isosurfaceBuffer = options.isosurfaceBuffer;
         }
@@ -143,7 +140,6 @@ export class FreeFlyCamera {
         });
         window.addEventListener("mouseup", () => { this.dragging = false; });
 
-        // Touch handling
         canvas.addEventListener("touchstart", (e) => {
             e.preventDefault();
             if (e.touches.length === 1) {
@@ -247,6 +243,10 @@ export class FreeFlyCamera {
     }
 
     update(dt: number) {
+        if (this.restrictToIsosurface && this.densityAt) {
+            this.position = this.ejectFromPlanet(this.position);
+        }
+
         let move = vec3.create();
         if (this.keys.has("keyw") || this.keys.has("arrowup")) {
             vec3.add(move, move, this.getForward());
@@ -266,24 +266,26 @@ export class FreeFlyCamera {
         if (this.keys.has("shiftleft") || this.keys.has("shift")) {
             vec3.sub(move, move, this.getUp());
         }
+        
         if (vec3.length(move) > 0.0001) {
             vec3.normalize(move, move);
             vec3.scale(move, move, this.moveSpeed * dt);
 
             if (this.restrictToIsosurface && this.densityAt) {
-                this.position = this.applyIsosurfaceConstraint(this.position, move);
+                this.position = this.applySoftBallConstraint(this.position, move);
+                this.position = this.ejectFromPlanet(this.position);
             } else {
                 vec3.add(this.position, this.position, move);
             }
         }
 
-        // Smooth zoom from pinch gestures
         if (Math.abs(this.targetZoomDelta) > 0.001) {
             this.smoothZoomVelocity += (this.targetZoomDelta - this.smoothZoomVelocity) * dt * 10;
             const move = vec3.create();
             vec3.scale(move, this.getForward(), this.smoothZoomVelocity);
             if (this.restrictToIsosurface && this.densityAt) {
-                this.position = this.applyIsosurfaceConstraint(this.position, move);
+                this.position = this.applySoftBallConstraint(this.position, move);
+                this.position = this.ejectFromPlanet(this.position);
             } else {
                 vec3.add(this.position, this.position, move);
             }
@@ -294,7 +296,6 @@ export class FreeFlyCamera {
             }
         }
 
-        // Smooth roll from pinch rotation
         if (Math.abs(this.targetRollDelta) > 0.001) {
             this.smoothRollVelocity += (this.targetRollDelta - this.smoothRollVelocity) * dt * 8;
             if (Math.abs(this.smoothRollVelocity) > 0.0001) {
@@ -310,7 +311,6 @@ export class FreeFlyCamera {
             }
         }
 
-        // Roll (Q/E)
         let roll = 0;
         if (this.keys.has("keyq")) roll -= this.rollSpeed * dt;
         if (this.keys.has("keye")) roll += this.rollSpeed * dt;
@@ -324,52 +324,150 @@ export class FreeFlyCamera {
         this.updateViewMatrix();
     }
 
-    private applyIsosurfaceConstraint(
-        position: vec3,
-        moveVec: vec3
-    ): vec3 {
+    private ejectFromPlanet(position: vec3): vec3 {
         const densityAt = this.densityAt!;
         const buffer = this.isosurfaceBuffer;
-
-        // Try full move (empirical: allow if d < buffer)
-        const trial = vec3.add(vec3.create(), position, moveVec);
-        const d = densityAt(trial[0], trial[1], trial[2]);
-        if (d < buffer) {
-            // Move is safe (empirical: inside or up to buffer)
-            return trial;
-        }
-
-        // Try sliding along tangent
-        const n = this.estimateDensityGradient(position);
-        const moveLen = vec3.length(moveVec);
-        const moveDir = vec3.normalize(vec3.create(), moveVec);
-        const dot = vec3.dot(moveDir, n);
-        const slideDir = vec3.sub(
-            vec3.create(),
-            moveDir,
-            vec3.scale(vec3.create(), n, dot)
-        );
-        if (vec3.length(slideDir) > 0.001) {
-            vec3.normalize(slideDir, slideDir);
-            const slideVec = vec3.scale(vec3.create(), slideDir, moveLen);
-            const slideTrial = vec3.add(vec3.create(), position, slideVec);
-            if (densityAt(slideTrial[0], slideTrial[1], slideTrial[2]) < buffer) {
-                return slideTrial;
+        
+        const currentDensity = densityAt(position[0], position[1], position[2]);
+        
+        if (currentDensity >= buffer) {
+            const surfaceNormal = this.estimateDensityGradient(position);
+            
+            let ejectedPos = vec3.clone(position);
+            const maxEjectionDistance = 10.0;
+            const ejectionStep = 0.2;
+            
+            for (let dist = ejectionStep; dist <= maxEjectionDistance; dist += ejectionStep) {
+                vec3.scaleAndAdd(ejectedPos, position, surfaceNormal, -dist);
+                
+                const testDensity = densityAt(ejectedPos[0], ejectedPos[1], ejectedPos[2]);
+                if (testDensity < buffer) {
+                    return ejectedPos;
+                }
+            }
+            
+            for (let dist = ejectionStep; dist <= maxEjectionDistance; dist += ejectionStep) {
+                ejectedPos = vec3.fromValues(position[0], position[1] + dist, position[2]);
+                
+                const testDensity = densityAt(ejectedPos[0], ejectedPos[1], ejectedPos[2]);
+                if (testDensity < buffer) {
+                    return ejectedPos;
+                }
             }
         }
+        
+        return position;
+    }
 
-        // Block movement
+    private applySoftBallConstraint(position: vec3, moveVec: vec3): vec3 {
+        const densityAt = this.densityAt!;
+        const buffer = this.isosurfaceBuffer;
+        
+        const steps = 8;
+        const stepSize = vec3.length(moveVec) / steps;
+        const moveDir = vec3.normalize(vec3.create(), moveVec);
+        
+        let currentPos = vec3.clone(position);
+        
+        for (let i = 0; i < steps; i++) {
+            const stepVec = vec3.scale(vec3.create(), moveDir, stepSize);
+            currentPos = this.singleStepSoftBall(currentPos, stepVec, densityAt, buffer);
+        }
+        
+        return currentPos;
+    }
+
+    private singleStepSoftBall(position: vec3, moveVec: vec3, densityAt: Function, buffer: number): vec3 {
+        const targetPos = vec3.add(vec3.create(), position, moveVec);
+        const targetDensity = densityAt(targetPos[0], targetPos[1], targetPos[2]);
+        
+        if (targetDensity < buffer) {
+            return targetPos;
+        }
+        
+        const alternatives = this.generateAlternativePaths(position, moveVec);
+        
+        for (const altPath of alternatives) {
+            const altTarget = vec3.add(vec3.create(), position, altPath);
+            const altDensity = densityAt(altTarget[0], altTarget[1], altTarget[2]);
+            
+            if (altDensity < buffer) {
+                return altTarget;
+            }
+        }
+        
         return vec3.clone(position);
     }
 
+    private generateAlternativePaths(position: vec3, moveVec: vec3): vec3[] {
+        const alternatives: vec3[] = [];
+        const moveLength = vec3.length(moveVec);
+        const moveDir = vec3.normalize(vec3.create(), moveVec);
+        
+        const surfaceNormal = this.estimateDensityGradient(position);
+        
+        const slideDir = vec3.create();
+        const normalComponent = vec3.dot(moveDir, surfaceNormal);
+        vec3.scaleAndAdd(slideDir, moveDir, surfaceNormal, -normalComponent);
+        if (vec3.length(slideDir) > 0.1) {
+            vec3.normalize(slideDir, slideDir);
+            alternatives.push(vec3.scale(vec3.create(), slideDir, moveLength * 0.8));
+        }
+        
+        const surfaceClimbBias = 0.3;
+        const climbDir = vec3.create();
+        vec3.copy(climbDir, moveDir);
+        vec3.scaleAndAdd(climbDir, climbDir, surfaceNormal, -surfaceClimbBias);
+        vec3.normalize(climbDir, climbDir);
+        alternatives.push(vec3.scale(vec3.create(), climbDir, moveLength * 0.7));
+        
+        const surfaceUp = vec3.negate(vec3.create(), surfaceNormal);
+        const rightVec = vec3.cross(vec3.create(), moveDir, surfaceUp);
+        vec3.normalize(rightVec, rightVec);
+        
+        const rightAngleDir = vec3.create();
+        vec3.lerp(rightAngleDir, moveDir, rightVec, 0.3);
+        vec3.normalize(rightAngleDir, rightAngleDir);
+        alternatives.push(vec3.scale(vec3.create(), rightAngleDir, moveLength * 0.6));
+        
+        const leftAngleDir = vec3.create();
+        vec3.lerp(leftAngleDir, moveDir, rightVec, -0.3);
+        vec3.normalize(leftAngleDir, leftAngleDir);
+        alternatives.push(vec3.scale(vec3.create(), leftAngleDir, moveLength * 0.6));
+        
+        const tangentDir = vec3.cross(vec3.create(), surfaceNormal, rightVec);
+        vec3.normalize(tangentDir, tangentDir);
+        
+        if (vec3.dot(tangentDir, moveDir) < 0) {
+            vec3.negate(tangentDir, tangentDir);
+        }
+        
+        vec3.scaleAndAdd(tangentDir, tangentDir, surfaceNormal, -0.2);
+        vec3.normalize(tangentDir, tangentDir);
+        alternatives.push(vec3.scale(vec3.create(), tangentDir, moveLength * 0.5));
+        
+        alternatives.push(vec3.scale(vec3.create(), moveDir, moveLength * 0.3));
+        alternatives.push(vec3.scale(vec3.create(), moveDir, moveLength * 0.1));
+        
+        const perpMovement = vec3.scale(vec3.create(), surfaceNormal, -moveLength * 0.5);
+        alternatives.push(perpMovement);
+        
+        return alternatives;
+    }
+
     private estimateDensityGradient(pos: vec3): vec3 {
-        const eps = 0.05;
+        const eps = 0.1;
         const densityAt = this.densityAt!;
         const dx = densityAt(pos[0] + eps, pos[1], pos[2]) - densityAt(pos[0] - eps, pos[1], pos[2]);
         const dy = densityAt(pos[0], pos[1] + eps, pos[2]) - densityAt(pos[0], pos[1] - eps, pos[2]);
         const dz = densityAt(pos[0], pos[1], pos[2] + eps) - densityAt(pos[0], pos[1], pos[2] - eps);
         const grad = vec3.fromValues(dx, dy, dz);
-        vec3.normalize(grad, grad);
+        const length = vec3.length(grad);
+        if (length > 0.001) {
+            vec3.scale(grad, grad, 1.0 / length);
+        } else {
+            vec3.set(grad, 0, 1, 0);
+        }
         return grad;
     }
 

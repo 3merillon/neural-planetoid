@@ -25,7 +25,7 @@ export const DEFAULTS: ConfigFields = {
     zBiasFactor: 0.000003,
     isoLevelBias: 0.0,
     dithering: true,
-    enableCollision: false,
+    enableCollision: true,
     backfaceCulling: true,
     tintLODLevels: false,
     enableTriplanar: true,
