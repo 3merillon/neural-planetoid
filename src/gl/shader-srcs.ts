@@ -157,13 +157,13 @@ vec4 calculate_material_weights(vec3 world_pos, vec3 world_normal) {
     return total > 0.001 ? weights / total : vec4(0.4, 0.3, 0.3, 0.0);
 }
 
-// Multi-material triplanar diffuse sampling (unchanged)
+// Triplanar diffuse sampling - only samples materials with significant weight
 vec3 triplanar_diffuse_multi(vec3 world_pos, vec3 world_normal, float scale, vec4 material_weights) {
     vec3 blend_weights = calculate_triplanar_weights(world_normal);
     vec3 final_color = vec3(0.0);
     
     for(int i = 0; i < 4; i++) {
-        if(material_weights[i] > 0.01) {
+        if(material_weights[i] > 0.05) { // Skip materials with low contribution
             vec3 color_x = texture(material_diffuse, vec3(world_pos.zy * scale, float(i))).rgb;
             vec3 color_y = texture(material_diffuse, vec3(world_pos.xz * scale, float(i))).rgb;
             vec3 color_z = texture(material_diffuse, vec3(world_pos.xy * scale, float(i))).rgb;
@@ -179,13 +179,13 @@ vec3 triplanar_diffuse_multi(vec3 world_pos, vec3 world_normal, float scale, vec
     return final_color;
 }
 
-// Multi-material triplanar normal sampling (unchanged)
+// Triplanar normal sampling - only samples materials with significant weight
 vec3 triplanar_normal_multi(vec3 world_pos, vec3 world_normal, float scale, vec4 material_weights) {
     vec3 blend_weights = calculate_triplanar_weights(world_normal);
     vec3 final_normal = vec3(0.0);
     
     for(int i = 0; i < 4; i++) {
-        if(material_weights[i] > 0.01) {
+        if(material_weights[i] > 0.05) { // Skip materials with low contribution
             vec3 normal_x = texture(material_normals, vec3(world_pos.zy * scale, float(i))).xyz * 2.0 - 1.0;
             vec3 normal_y = texture(material_normals, vec3(world_pos.xz * scale, float(i))).xyz * 2.0 - 1.0;
             vec3 normal_z = texture(material_normals, vec3(world_pos.xy * scale, float(i))).xyz * 2.0 - 1.0;
@@ -229,13 +229,13 @@ vec3 triplanar_normal_multi(vec3 world_pos, vec3 world_normal, float scale, vec4
     return normalize(mix(world_normal, final_normal, 0.8));
 }
 
-// Multi-material triplanar roughness sampling (unchanged)
+// Triplanar roughness sampling - only samples materials with significant weight
 float triplanar_roughness_multi(vec3 world_pos, vec3 world_normal, float scale, vec4 material_weights) {
     vec3 blend_weights = calculate_triplanar_weights(world_normal);
     float final_roughness = 0.0;
     
     for(int i = 0; i < 4; i++) {
-        if(material_weights[i] > 0.01) {
+        if(material_weights[i] > 0.05) { // Skip materials with low contribution
             float roughness_x = texture(material_roughness, vec3(world_pos.zy * scale, float(i))).r;
             float roughness_y = texture(material_roughness, vec3(world_pos.xz * scale, float(i))).r;
             float roughness_z = texture(material_roughness, vec3(world_pos.xy * scale, float(i))).r;
@@ -251,7 +251,7 @@ float triplanar_roughness_multi(vec3 world_pos, vec3 world_normal, float scale, 
     return final_roughness;
 }
 
-// Dithering (unchanged)
+// Dithering matrix for LOD transitions
 const mat4 bayerMatrix = mat4(
     0.0/16.0,  8.0/16.0,  2.0/16.0, 10.0/16.0,
     12.0/16.0, 4.0/16.0, 14.0/16.0,  6.0/16.0,
@@ -266,8 +266,16 @@ float getBayerValue(ivec2 coord) {
 }
 
 void main(void) {
-    // LOD fade dithering (unchanged)
+    // Early fragment culling
     float distance_to_camera = length(eye_pos - vpos);
+    
+    // Discard fragments that are too far away
+    if (distance_to_camera > fade_far * 2.0) discard;
+    
+    // Discard LOD > 0 fragments that are too close
+    if (lod_level > 0 && distance_to_camera < fade_near * 0.5) discard;
+
+    // LOD fade dithering using pre-calculated distance
     if (enable_dithering) {
         bool should_discard = false;
         if (lod_level == 0) {
@@ -304,7 +312,7 @@ void main(void) {
         if (should_discard) discard;
     }
 
-    // Multi-material sampling with planetoid-aware logic
+    // Material sampling and lighting
     vec3 base_color;
     vec3 surface_normal;
     float roughness;
@@ -328,7 +336,7 @@ void main(void) {
         base_color = mix(base_color, lod_color, tint_strength);
     }
 
-    // Lighting setup (unchanged)
+    // Lighting calculations
     vec3 view_dir = normalize(eye_pos - vpos);
     vec3 light_dir = -normalize(sun_direction);
     vec3 half_dir = normalize(view_dir + light_dir);
@@ -354,7 +362,6 @@ void main(void) {
     color = vec4(final_color, 1.0);
 }`;
 
-// Keep other shaders unchanged
 export const vertShader = `#version 300 es
 #line 4
 layout(location=0) in vec3 pos;
