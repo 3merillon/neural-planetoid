@@ -1,326 +1,387 @@
 import { Chunk } from "./chunk";
-//import { densityAtRaw } from "./density";
 import { MarchingCubes } from "../marching-cubes-wasm/marching_cubes";
 import { computeNormalsFieldGradientJS } from "./field-gradient";
-import { mat4 } from "gl-matrix";
-import { ChunkConfigManager, type LODLevel } from "./chunk-config";
+import { mat4, vec3 } from "gl-matrix";
+import { ChunkConfigManager, type LODLevel, type WorldLODConfig } from "./chunk-config";
 import { WorkerManager } from "./worker-manager";
 import { ChunkPool } from "./chunk-pool";
+import { Frustum, createAABBForChunk, FrustumResult } from "./frustum-culling";
 
 function chunkKey(x: number, y: number, z: number, worldSize: number): string {
-    return `${x},${y},${z},${worldSize}`;
+  return `${x},${y},${z},${worldSize}`;
+}
+
+interface ChunkRequest {
+  chunkX: number;
+  chunkY: number;
+  chunkZ: number;
+  worldSize: number;
+  lodLevel: number;
+  priority: number;
+  distance: number;
 }
 
 export class ChunkManager {
-    private configManager: ChunkConfigManager;
-    private workerManager: WorkerManager;
-    private chunkPool: ChunkPool;
-    public chunks: Map<string, Chunk> = new Map();
-    private pendingChunks: Set<string> = new Set();
-    private lastCameraPosition: [number, number, number] = [0, 0, 0];
+  private configManager: ChunkConfigManager;
+  private workerManager: WorkerManager;
+  private chunkPool: ChunkPool;
+  private frustum: Frustum;
 
-    constructor(
-        public marchingCubes: MarchingCubes,
-        public gl: WebGL2RenderingContext,
-        public shader: any,
-        public uniforms: any
+  public chunks = new Map<string, Chunk>();
+  private pending = new Set<string>();
+  private tempNeeded = new Set<string>();
+
+  private offsetCache = new Map<number, Array<{dx:number,dy:number,dz:number,gridDist:number,euclidDist:number}>>();
+
+  constructor(
+    public marchingCubes: MarchingCubes,
+    public gl: WebGL2RenderingContext,
+    public shader: any,
+    public uniforms: any
+  ) {
+    this.configManager = ChunkConfigManager.getInstance();
+    const cfg = this.configManager.getConfig();
+    this.workerManager = new WorkerManager(cfg.maxWorkers);
+    this.chunkPool = new ChunkPool(cfg.maxChunks);
+    this.frustum = new Frustum();
+  }
+
+  private worldToChunk(x:number, y:number, z:number, worldSize:number):[number,number,number] {
+    return [ Math.floor(x/worldSize), Math.floor(y/worldSize), Math.floor(z/worldSize) ];
+  }
+
+  private getOffsets(radius:number) {
+    let arr = this.offsetCache.get(radius);
+    if (arr) return arr;
+    arr = [];
+    for(let dz=-radius; dz<=radius; dz++){
+      for(let dy=-radius; dy<=radius; dy++){
+        for(let dx=-radius; dx<=radius; dx++){
+          const gridDist = Math.max(Math.abs(dx),Math.abs(dy),Math.abs(dz));
+          const euclidDist = Math.hypot(dx,dy,dz);
+          arr.push({dx,dy,dz,gridDist,euclidDist});
+        }
+      }
+    }
+    arr.sort((a,b)=> a.gridDist - b.gridDist || a.euclidDist - b.euclidDist);
+    this.offsetCache.set(radius, arr);
+    return arr;
+  }
+
+  private dispatchBuckets(buckets: ChunkRequest[][]) {
+    for (let lod = 0; lod < buckets.length; lod++) {
+      for (const req of buckets[lod]) {
+        if (this.workerManager.getStats().availableWorkers === 0) return;
+        const key = chunkKey(req.chunkX, req.chunkY, req.chunkZ, req.worldSize);
+        if (!this.chunks.has(key) && !this.pending.has(key)) {
+          this.pending.add(key);
+          const lodCfg = this.configManager.getLODLevel(req.lodLevel)!;
+          this.generateChunkAsync(req.chunkX, req.chunkY, req.chunkZ, lodCfg);
+        }
+      }
+    }
+  }
+
+  update(cameraPos: [number,number,number], projectionViewMatrix?: mat4) {
+    const cfg = this.configManager.getConfig();
+    if (projectionViewMatrix) {
+      this.frustum.updateFromMatrix(projectionViewMatrix);
+    }
+
+    // Clear pool usage and tempNeeded
+    this.chunkPool.setCameraPosition(cameraPos);
+    for (const c of this.chunks.values()) {
+      this.chunkPool.markNotInUse(c.chunkX, c.chunkY, c.chunkZ, c.worldSize);
+    }
+    this.tempNeeded.clear();
+
+    // Prepare buckets - dynamic based on actual LOD count
+    const numLODs = cfg.lodLevels.length;
+    const visibleBuckets    = Array.from({ length: numLODs }, ()=>[] as ChunkRequest[]);
+    const backgroundBuckets = Array.from({ length: numLODs }, ()=>[] as ChunkRequest[]);
+
+    // Hierarchical culling bookkeeping
+    const culledRegions: {[lvl:number]:Set<string>} = {};
+    const sortedLODs = [...cfg.lodLevels].sort((a,b)=>b.level - a.level);
+    for (const lodCfg of sortedLODs) {
+      culledRegions[lodCfg.level] = new Set<string>();
+      this.processLODLevel(cameraPos, lodCfg, culledRegions, visibleBuckets, backgroundBuckets);
+    }
+
+    // Dispatch
+    this.dispatchBuckets(visibleBuckets);
+    if (this.workerManager.getStats().availableWorkers > 0) {
+      this.dispatchBuckets(backgroundBuckets);
+    }
+
+    this.updateActiveChunks();
+  }
+
+  private processLODLevel(
+    cameraPos: [number, number, number],
+    lod: LODLevel,
+    culledRegions: { [lvl: number]: Set<string> },
+    visB: ChunkRequest[][],
+    backB: ChunkRequest[][]
     ) {
-        this.configManager = ChunkConfigManager.getInstance();
-        const config = this.configManager.getConfig();
-        
-        this.workerManager = new WorkerManager(config.maxWorkers);
-        this.chunkPool = new ChunkPool(config.maxChunks);
-    }
+    const cfg = this.configManager.getConfig();
+    const numLODs = cfg.lodLevels.length;
+    
+    const lvl    = lod.level;
+    const parent = lvl + 1;
+    const radius = lod.maxDistance;
+    const ws     = lod.worldSize;
 
-    worldToChunk(x: number, y: number, z: number, worldSize: number): [number, number, number] {
-        return [
-            Math.floor(x / worldSize),
-            Math.floor(y / worldSize),
-            Math.floor(z / worldSize)
-        ];
-    }
+    // Camera in chunk coords, aligned to grid
+    const [cx, cy, cz] = this.worldToChunk(cameraPos[0], cameraPos[1], cameraPos[2], ws);
+    const scale = lod.gridAlignment / ws;
+    const ax = Math.floor(cx * ws / lod.gridAlignment) * scale;
+    const ay = Math.floor(cy * ws / lod.gridAlignment) * scale;
+    const az = Math.floor(cz * ws / lod.gridAlignment) * scale;
 
-    alignToGrid(coord: number, alignment: number): number {
-        return Math.floor(coord / alignment) * alignment;
-    }
+    const offsets = this.getOffsets(radius);
 
-    update(cameraPos: [number, number, number]) {
-        const config = this.configManager.getConfig();
-        
-        // Update camera position in pool for priority calculations
-        this.chunkPool.setCameraPosition(cameraPos);
-        this.lastCameraPosition = [...cameraPos];
-        
-        // Mark all chunks as not in use initially
-        for (const [key, chunk] of this.chunks) {
-            this.chunkPool.markNotInUse(chunk.chunkX, chunk.chunkY, chunk.chunkZ, chunk.worldSize);
-        }
-        
-        let needed = new Set<string>();
-        
-        // Process LOD levels in priority order: LOD0 first, then LOD1, then LOD2
-        const sortedLODs = [...config.lodLevels].sort((a, b) => a.level - b.level);
-        
-        for (const lodLevel of sortedLODs) {
-            this.updateLODLevel(cameraPos, lodLevel, needed);
-        }
-        
-        // Remove chunks that are no longer needed from active set
-        for (let key of this.chunks.keys()) {
-            if (!needed.has(key)) {
-                const chunk = this.chunks.get(key)!;
-                this.chunkPool.markNotInUse(chunk.chunkX, chunk.chunkY, chunk.chunkZ, chunk.worldSize);
-                this.chunks.delete(key);
-            }
-        }
-    }
+    for (const off of offsets) {
+        const x   = Math.round(ax + off.dx * scale);
+        const y   = Math.round(ay + off.dy * scale);
+        const z   = Math.round(az + off.dz * scale);
+        const key = chunkKey(x, y, z, ws);
 
-    private updateLODLevel(cameraPos: [number, number, number], lodLevel: LODLevel, needed: Set<string>) {
-        // Convert camera position to this LOD's chunk coordinates
-        const [cx, cy, cz] = this.worldToChunk(...cameraPos, lodLevel.worldSize);
-        
-        // Align camera chunk position to LOD grid
-        const alignedCx = Math.floor(cx * lodLevel.worldSize / lodLevel.gridAlignment) * (lodLevel.gridAlignment / lodLevel.worldSize);
-        const alignedCy = Math.floor(cy * lodLevel.worldSize / lodLevel.gridAlignment) * (lodLevel.gridAlignment / lodLevel.worldSize);
-        const alignedCz = Math.floor(cz * lodLevel.worldSize / lodLevel.gridAlignment) * (lodLevel.gridAlignment / lodLevel.worldSize);
-        
-        // Generate chunks in priority order: closest first
-        const radius = lodLevel.maxDistance;
-        const chunksToGenerate = [];
-        
-        for (let dz = -radius; dz <= radius; ++dz) {
-            for (let dy = -radius; dy <= radius; ++dy) {
-                for (let dx = -radius; dx <= radius; ++dx) {
-                    // Calculate distance from camera
-                    const distance = Math.max(Math.abs(dx), Math.abs(dy), Math.abs(dz));
-                    
-                    // Generate all chunks up to this LOD's max distance
-                    if (distance > lodLevel.maxDistance) {
-                        continue;
-                    }
-                    
-                    // Calculate chunk coordinates
-                    let kx = alignedCx + dx * (lodLevel.gridAlignment / lodLevel.worldSize);
-                    let ky = alignedCy + dy * (lodLevel.gridAlignment / lodLevel.worldSize);
-                    let kz = alignedCz + dz * (lodLevel.gridAlignment / lodLevel.worldSize);
-                    
-                    // Ensure proper grid alignment
-                    kx = Math.round(kx);
-                    ky = Math.round(ky);
-                    kz = Math.round(kz);
-                    
-                    chunksToGenerate.push({ kx, ky, kz, distance });
-                }
-            }
-        }
-        
-        // Sort chunks by distance (closest first) for priority generation
-        chunksToGenerate.sort((a, b) => a.distance - b.distance);
-        
-        // Process chunks in priority order
-        for (const { kx, ky, kz } of chunksToGenerate) {
-            let key = chunkKey(kx, ky, kz, lodLevel.worldSize);
-            needed.add(key);
-            
-            // Check if chunk exists in pool first
-            let chunk = this.chunkPool.getChunk(kx, ky, kz, lodLevel.worldSize);
-            
-            if (chunk) {
-                // Chunk exists in pool, add to active chunks
-                this.chunks.set(key, chunk);
-                this.chunkPool.markInUse(kx, ky, kz, lodLevel.worldSize);
-            } else if (!this.chunks.has(key) && !this.pendingChunks.has(key)) {
-                // Need to generate new chunk
-                this.pendingChunks.add(key);
-                this.generateChunkAsync(kx, ky, kz, lodLevel);
-            }
-        }
-    }
+        // 1) Keep alive in pool
+        this.tempNeeded.add(key);
 
-    private async generateChunkAsync(
-        chunkX: number, 
-        chunkY: number, 
-        chunkZ: number, 
-        lodLevel: LODLevel
-    ): Promise<void> {
-        const config = this.configManager.getConfig();
-        const seed = this.configManager.getSeed();
-        const isoLevelBias = this.configManager.getIsoLevelBias() * lodLevel.level;
-        const zBiasFactor = this.configManager.getZBiasFactor();
-        
-        try {
-            const result = await this.workerManager.generateChunk(
-                chunkX, 
-                chunkY, 
-                chunkZ, 
-                lodLevel.worldSize, 
-                config.voxelGridSize,
-                lodLevel.level,
-                isoLevelBias, // pass per-LOD bias
-                seed
-            );
-            
-            if (result.type === 'complete' && result.volume) {
-                const chunk = new Chunk(
-                    chunkX, 
-                    chunkY, 
-                    chunkZ, 
-                    lodLevel.worldSize,
-                    lodLevel.level,
-                    lodLevel.color,
-                    lodLevel.fadeNear,
-                    lodLevel.fadeFar,
-                    lodLevel.zBias
-                );
-                chunk.state = "generating";
-                
-                // Process the volume data with marching cubes
-                this.processChunkVolume(chunk, result.volume, result.voxelGridSize!, lodLevel);
-                
-                // Add to pool and active chunks if still needed
-                this.chunkPool.addChunk(chunk);
-                const key = chunkKey(chunkX, chunkY, chunkZ, lodLevel.worldSize);
-                
-                // Only add to active chunks if still needed
-                if (this.pendingChunks.has(key)) {
-                    this.chunks.set(key, chunk);
-                    this.chunkPool.markInUse(chunkX, chunkY, chunkZ, lodLevel.worldSize);
-                }
-            }
-        } catch (error) {
-            //console.error(`Failed to generate LOD${lodLevel.level} chunk (${chunkX}, ${chunkY}, ${chunkZ}):`, error);
-        } finally {
-            const key = chunkKey(chunkX, chunkY, chunkZ, lodLevel.worldSize);
-            this.pendingChunks.delete(key);
+        // 2) Skip generation _only_ if outside view radius (world units)
+        const centerX = (x + 0.5) * ws;
+        const centerY = (y + 0.5) * ws;
+        const centerZ = (z + 0.5) * ws;
+        const dx = centerX - cameraPos[0];
+        const dy = centerY - cameraPos[1];
+        const dz = centerZ - cameraPos[2];
+        const centerDist = Math.hypot(dx, dy, dz);
+        if (centerDist > lod.maxDistance * ws * 1.1) { //10% buffer to generate chunk before it starts fading in
+        continue;
         }
-    }
 
-    private processChunkVolume(
-        chunk: Chunk, 
-        volume: Uint8Array, 
-        voxelGridSize: number, 
-        lodLevel: LODLevel
-    ): void {
-        try {
-            this.marchingCubes.set_volume(volume, voxelGridSize + 1, voxelGridSize + 1, voxelGridSize + 1);
-            const mesh = this.marchingCubes.marching_cubes_indexed_pos(0.5);
-            const positions = Reflect.get(mesh, "vertices") as Float32Array;
-            const indices = Reflect.get(mesh, "indices") as Uint32Array;
-            
-            const [ox, oy, oz] = chunk.getWorldOrigin();
-            const voxelSize = lodLevel.worldSize / voxelGridSize;
-            
-            // Convert to world coordinates
-            const worldPositions = new Float32Array(positions.length);
-            for (let i = 0; i < positions.length; i += 3) {
-                worldPositions[i] = positions[i] * voxelSize + ox;
-                worldPositions[i + 1] = positions[i + 1] * voxelSize + oy;
-                worldPositions[i + 2] = positions[i + 2] * voxelSize + oz;
-            }
-            
-            // Compute normals
-            const seed = this.configManager.getSeed();
-            const isoLevelBias = this.configManager.getIsoLevelBias() * lodLevel.level;
-            const normals = computeNormalsFieldGradientJS(
-                worldPositions,
-                seed,
-                isoLevelBias,
-                0.5 * voxelSize
-            );
-            
-            // Interleave positions and normals
-            const interleaved = new Float32Array((worldPositions.length / 3) * 6);
-            for (let i = 0, j = 0; i < worldPositions.length; i += 3, j += 6) {
-                interleaved[j] = worldPositions[i];
-                interleaved[j + 1] = worldPositions[i + 1];
-                interleaved[j + 2] = worldPositions[i + 2];
-                interleaved[j + 3] = normals[i];
-                interleaved[j + 4] = normals[i + 1];
-                interleaved[j + 5] = normals[i + 2];
-            }
-            
-            chunk.meshVertices = interleaved;
-            chunk.meshIndices = indices;
-            chunk.state = "ready";
-            chunk.setupGL(this.gl, this.shader);
-        } catch (e) {
-            chunk.state = "error";
-            //console.error("Chunk processing error:", e);
+        // 3) Hierarchical skip if parent LOD was outside
+        if (parent in culledRegions) {
+        const pSize = this.configManager.getLODLevel(parent)!.worldSize;
+        const px = Math.floor((x * ws) / pSize);
+        const py = Math.floor((y * ws) / pSize);
+        const pz = Math.floor((z * ws) / pSize);
+        const pKey = chunkKey(px, py, pz, pSize);
+        if (culledRegions[parent].has(pKey)) {
+            continue;
         }
-    }
+        }
 
-    renderAll(gl: WebGL2RenderingContext, shader: any, projView: mat4, eye: [number,number,number], uniforms: any) {
-        const config = this.configManager.getConfig();
+        // 4) Re-activate pool if already loaded or pending
+        if (this.chunks.has(key) || this.pending.has(key)) {
+        const pooled = this.chunkPool.getChunk(x, y, z, ws);
+        if (pooled) {
+            this.chunks.set(key, pooled);
+            this.chunkPool.markInUse(x, y, z, ws);
+        }
+        continue;
+        }
+
+        // 5) Frustum‐cull
+        const aabb = createAABBForChunk(x, y, z, ws);
+        const res  = this.frustum.testAABB(aabb);
+        const isVisible = res !== FrustumResult.OUTSIDE;
+        if (!isVisible) {
+        culledRegions[lvl].add(key);
+        }
+
+        // 6) Build the chunk request with dynamic priority calculation
+        const maxPriority = 100000;
+        const basePri = isVisible
+        ? (lvl === 0 ? maxPriority : Math.max(1000, maxPriority / Math.pow(2, lvl)))
+        : (lvl === 0 ? maxPriority / 10 : Math.max(100, maxPriority / Math.pow(2, lvl + 3)));
         
-        // Add z-bias factor to uniforms
-        const extendedUniforms = {
-            ...uniforms,
-            enable_dithering: config.enableDithering,
-            max_lod_level: config.lodLevels.length - 1,
-            z_bias_factor: config.zBiasFactor
+        const penalty = Math.min(centerDist * (isVisible ? 10 : 5),
+                                isVisible ? 5000 : 2500);
+        const priority = basePri - penalty;
+
+        const req: ChunkRequest = {
+        chunkX: x,
+        chunkY: y,
+        chunkZ: z,
+        worldSize: ws,
+        lodLevel: lvl,
+        priority,
+        distance: centerDist
         };
-        
-        // Render in reverse order (highest LOD number first)
-        const chunksByLOD: Chunk[][] = Array(config.lodLevels.length).fill(null).map(() => []);
-        
-        for (let chunk of this.chunks.values()) {
-            if (chunk.state === "ready" && chunk.lodLevel >= 0 && chunk.lodLevel < config.lodLevels.length) {
-                chunksByLOD[chunk.lodLevel].push(chunk);
-            }
-        }
-        
-        // Render from highest LOD to lowest (back to front)
-        for (let lod = config.lodLevels.length - 1; lod >= 0; lod--) {
-            for (let chunk of chunksByLOD[lod]) {
-                chunk.render(gl, shader, projView, eye, extendedUniforms);
-            }
+
+        if (isVisible) {
+        visB[lvl].push(req);
+        } else {
+        backB[lvl].push(req);
         }
     }
+  }
 
-    getStats() {
-        const config = this.configManager.getConfig();
-        const workerStats = this.workerManager.getStats();
-        const poolStats = this.chunkPool.getStats();
-        
-        let ready = 0, gen = 0, err = 0;
-        let lodCounts = [0, 0, 0, 0, 0]; // Count per LOD level (0-4)
-        
-        for (let c of this.chunks.values()) {
-            if (c.state === "ready") {
-                ready++;
-                if (c.lodLevel >= 0 && c.lodLevel < 5) {
-                    lodCounts[c.lodLevel]++;
-                }
-            } else if (c.state === "generating") gen++;
-            else if (c.state === "error") err++;
+  private updateActiveChunks() {
+    for (const key of this.chunks.keys()) {
+      if (!this.tempNeeded.has(key)) {
+        const c = this.chunks.get(key)!;
+        this.chunkPool.markNotInUse(c.chunkX, c.chunkY, c.chunkZ, c.worldSize);
+        this.chunks.delete(key);
+      }
+    }
+    for (const key of this.tempNeeded) {
+      const c = this.chunks.get(key);
+      if (c) this.chunkPool.markInUse(c.chunkX, c.chunkY, c.chunkZ, c.worldSize);
+    }
+  }
+
+  // Worker‐backed chunk generation
+  private async generateChunkAsync(
+    chunkX:number, chunkY:number, chunkZ:number, lodLevel:LODLevel
+  ) {
+    const cfg  = this.configManager.getConfig();
+    const seed = this.configManager.getSeed();
+    const iso  = this.configManager.getIsoLevelBias() + lodLevel.isoOffset;
+
+    try {
+      const res = await this.workerManager.generateChunk(
+        chunkX,chunkY,chunkZ, lodLevel.worldSize, cfg.voxelGridSize,
+        lodLevel.level, iso, seed
+      );
+      if (res.type==='complete' && res.volume) {
+        const chunk = new Chunk(
+          chunkX,chunkY,chunkZ,
+          lodLevel.worldSize, lodLevel.level,
+          lodLevel.color, lodLevel.fadeNear,
+          lodLevel.fadeFar, lodLevel.zBias
+        );
+        chunk.state = "generating";
+        this.processChunkVolume(chunk, res.volume, res.voxelGridSize!, lodLevel);
+        this.chunkPool.addChunk(chunk);
+        const key = chunkKey(chunkX,chunkY,chunkZ,lodLevel.worldSize);
+        if (this.tempNeeded.has(key)) {
+          this.chunks.set(key, chunk);
+          this.chunkPool.markInUse(chunkX,chunkY,chunkZ,lodLevel.worldSize);
         }
-        
-        return {
-            ready,
-            gen,
-            err,
-            total: this.chunks.size,
-            pending: this.pendingChunks.size,
-            lodCounts,
-            poolLodCounts: poolStats.lodCounts,
-            voxelGridSize: config.voxelGridSize,
-            worldSize: config.worldSize,
-            voxelSize: config.worldSize / config.voxelGridSize,
-            workers: workerStats,
-            pool: poolStats,
-            ditheringEnabled: config.enableDithering
-        };
+      }
+    } catch (e) {
+      console.error("Worker error", e);
+    } finally {
+      const key = chunkKey(chunkX,chunkY,chunkZ,lodLevel.worldSize);
+      this.pending.delete(key);
     }
+  }
 
-    cleanup(): void {
-        this.workerManager.terminate();
-        this.chunkPool.cleanup(this.gl);
-        this.chunks.clear();
-        this.pendingChunks.clear();
-    }
+  // Marching‐cubes + GL setup
+  private processChunkVolume(
+    chunk: Chunk,
+    volume: Uint8Array,
+    voxelGridSize: number,
+    lodLevel: LODLevel
+  ) {
+    try {
+      this.marchingCubes.set_volume(volume, voxelGridSize+1, voxelGridSize+1, voxelGridSize+1);
+      const mesh = this.marchingCubes.marching_cubes_indexed_pos(0.5);
+      const positions = Reflect.get(mesh, "vertices")   as Float32Array;
+      const indices   = Reflect.get(mesh, "indices")    as Uint32Array;
+      const [ox,oy,oz] = chunk.getWorldOrigin();
+      const vsize      = lodLevel.worldSize / voxelGridSize;
 
-    // Debug method to get detailed priority info
-    public getPoolPriorityInfo() {
-        return this.chunkPool.getPriorityInfo();
+      // world‐position + normals
+      const worldPos = new Float32Array(positions.length);
+      for(let i=0;i<positions.length;i+=3){
+        worldPos[i]   = positions[i]   * vsize + ox;
+        worldPos[i+1] = positions[i+1] * vsize + oy;
+        worldPos[i+2] = positions[i+2] * vsize + oz;
+      }
+      const seed = this.configManager.getSeed();
+      const iso  = this.configManager.getIsoLevelBias() + lodLevel.isoOffset;
+      const normals = computeNormalsFieldGradientJS(
+        worldPos, seed, iso, 0.5*vsize
+      );
+
+      // interleave
+      const inter = new Float32Array((worldPos.length/3)*6);
+      for(let i=0,j=0;i<worldPos.length;i+=3,j+=6){
+        inter[j]=worldPos[i];
+        inter[j+1]=worldPos[i+1];
+        inter[j+2]=worldPos[i+2];
+        inter[j+3]=normals[i];
+        inter[j+4]=normals[i+1];
+        inter[j+5]=normals[i+2];
+      }
+      chunk.meshVertices = inter;
+      chunk.meshIndices  = indices;
+      chunk.state = "ready";
+      chunk.setupGL(this.gl, this.shader);
+    } catch(e){
+      chunk.state = "error";
+      console.error("Chunk process error", e);
     }
+  }
+
+  // Render all chunks
+  public renderAll(
+    gl: WebGL2RenderingContext,
+    shader: any,
+    projView: mat4,
+    eye: [number,number,number],
+    uniforms: any
+  ) {
+    const cfg = this.configManager.getConfig();
+    const ext = {
+      ...uniforms,
+      enable_dithering: cfg.enableDithering,
+      max_lod_level:    cfg.lodLevels.length-1,
+      z_bias_factor:    cfg.zBiasFactor
+    };
+
+    // bucket chunks by LOD - dynamic array size
+    const buckets: Chunk[][] = Array(cfg.lodLevels.length).fill(null).map(()=>[]);
+    for(const c of this.chunks.values()){
+      if(c.state==="ready" && c.lodLevel>=0 && c.lodLevel<cfg.lodLevels.length){
+        buckets[c.lodLevel].push(c);
+      }
+    }
+    // draw coarsest→finest
+    for(let lod=buckets.length-1;lod>=0;lod--){
+      for(const c of buckets[lod]){
+        c.render(gl, shader, projView, eye, ext);
+      }
+    }
+  }
+
+  // Stats
+  public getStats() {
+    const cfg = this.configManager.getConfig();
+    const ws = this.workerManager.getStats();
+    const ps = this.chunkPool.getStats();
+    let ready=0, gen=0, err=0;
+    const lodCounts = new Array(cfg.lodLevels.length).fill(0);
+
+    for(const c of this.chunks.values()){
+      if(c.state==="ready") {
+        ready++;
+        if (c.lodLevel >= 0 && c.lodLevel < cfg.lodLevels.length) {
+          lodCounts[c.lodLevel] = (lodCounts[c.lodLevel]||0)+1;
+        }
+      } else if(c.state==="generating") gen++;
+      else if(c.state==="error") err++;
+    }
+    return {
+      ready, gen, err,
+      total: this.chunks.size,
+      pending: this.pending.size,
+      lodCounts,
+      pool: ps,
+      workers: ws
+    };
+  }
+
+  // Cleanup
+  public cleanup() {
+    this.workerManager.terminate();
+    this.chunkPool.cleanup(this.gl);
+    this.chunks.clear();
+    this.pending.clear();
+  }
 }

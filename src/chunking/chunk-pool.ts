@@ -1,4 +1,5 @@
 import { Chunk } from "./chunk";
+import { ChunkConfigManager } from "./chunk-config";
 
 export interface ChunkPoolEntry {
     chunk: Chunk;
@@ -12,9 +13,11 @@ export class ChunkPool {
     private pool: Map<string, ChunkPoolEntry> = new Map();
     private maxSize: number;
     private cameraPosition: [number, number, number] = [0, 0, 0];
+    private configManager: ChunkConfigManager;
 
     constructor(maxSize: number = 512) {
         this.maxSize = maxSize;
+        this.configManager = ChunkConfigManager.getInstance();
     }
 
     private chunkKey(x: number, y: number, z: number, worldSize: number): string {
@@ -44,19 +47,21 @@ export class ChunkPool {
     }
 
     private calculatePriority(chunk: Chunk, distance: number): number {
-        // Priority calculation:
-        // - LOD0 gets highest base priority (1000)
-        // - LOD1 gets medium base priority (500)
-        // - LOD2 gets lowest base priority (100)
-        // - Closer chunks get higher priority (subtract distance)
-        // - In-use chunks get bonus (+500)
+        // Dynamic priority calculation based on available LOD levels
+        const config = this.configManager.getConfig();
+        const numLODs = config.lodLevels.length;
         
+        // Calculate base priority: L0 gets highest, each level gets exponentially lower
+        const maxBasePriority = 1000;
         let basePriority = 0;
-        switch (chunk.lodLevel) {
-            case 0: basePriority = 1000; break; // LOD0 highest priority
-            case 1: basePriority = 500; break;  // LOD1 medium priority
-            case 2: basePriority = 100; break;  // LOD2 lowest priority
-            default: basePriority = 50; break;
+        
+        if (chunk.lodLevel === 0) {
+            basePriority = maxBasePriority; // L0 always gets highest priority
+        } else if (chunk.lodLevel < numLODs) {
+            // Exponential decay for higher LODs
+            basePriority = Math.max(50, maxBasePriority / Math.pow(2, chunk.lodLevel));
+        } else {
+            basePriority = 50; // Fallback for unexpected LOD levels
         }
         
         // Distance penalty (closer = higher priority)
@@ -186,9 +191,12 @@ export class ChunkPool {
     }
 
     public getStats() {
+        const config = this.configManager.getConfig();
+        const numLODs = config.lodLevels.length;
+        
         let inUse = 0;
         let cached = 0;
-        let lodCounts = [0, 0, 0, 0, 0]; // Updated for 5 LOD levels
+        let lodCounts = new Array(numLODs).fill(0);
         let priorityStats = { min: Infinity, max: -Infinity, avg: 0 };
         let totalPriority = 0;
         
@@ -200,7 +208,7 @@ export class ChunkPool {
             }
             
             // Count by LOD level
-            if (entry.chunk.lodLevel >= 0 && entry.chunk.lodLevel < 5) {
+            if (entry.chunk.lodLevel >= 0 && entry.chunk.lodLevel < numLODs) {
                 lodCounts[entry.chunk.lodLevel]++;
             }
             

@@ -23,12 +23,15 @@ dist-ssr
 *.sln
 *.sw?
 
-# Rust build artifacts (for wasm)
+# Rust build artifacts
 rust/marching-cubes/pkg/
 rust/marching-cubes/target/
 
-# WASM build outputs in Vite src (optional)
+# WASM build outputs in Vite src
 src/gl/marching-cubes-wasm/marching_cubes_bg.wasm
 src/gl/marching-cubes-wasm/marching_cubes.js
 src/gl/marching-cubes-wasm/marching_cubes_bg.js
 src/gl/marching-cubes-wasm/.wasm-pack*
+
+# Vite config
+vite.config.js

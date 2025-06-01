@@ -1,5 +1,6 @@
 import { createChunkWorker } from "./chunk-worker";
 import type { ChunkWorkMessage, ChunkWorkResult } from "./chunk-worker";
+import { ChunkConfigManager } from "./chunk-config";
 
 export interface WorkerTask {
     chunkX: number;
@@ -27,9 +28,11 @@ export class WorkerManager {
     private taskQueue: WorkerTask[] = [];
     private activeTasks: Map<number, ActiveTask> = new Map();
     private maxWorkers: number;
+    private configManager: ChunkConfigManager;
 
     constructor(maxWorkers: number = navigator.hardwareConcurrency || 4) {
         this.maxWorkers = Math.min(maxWorkers, 8);
+        this.configManager = ChunkConfigManager.getInstance();
         this.initializeWorkers();
     }
 
@@ -87,16 +90,21 @@ export class WorkerManager {
     }
 
     private calculatePriority(lodLevel: number, chunkX: number, chunkY: number, chunkZ: number): number {
+        // Dynamic priority calculation based on current LOD configuration
+        const config = this.configManager.getConfig();
+        const numLODs = config.lodLevels.length;
+        
         // Higher priority = processed first
         // L0 gets massive priority boost to always be first
         let basePriority = 0;
-        switch (lodLevel) {
-            case 0: basePriority = 10000; break; // L0 chunks get highest priority
-            case 1: basePriority = 5000; break;  // L1 chunks get high priority
-            case 2: basePriority = 2500; break;  // L2 chunks get medium priority
-            case 3: basePriority = 1000; break;  // L3 chunks get low priority
-            case 4: basePriority = 500; break;   // L4 chunks get lowest priority
-            default: basePriority = 10; break;
+        
+        if (lodLevel === 0) {
+            basePriority = 10000; // L0 always gets highest priority
+        } else if (lodLevel < numLODs) {
+            // Exponential decay for higher LODs
+            basePriority = Math.max(10, 10000 / Math.pow(2, lodLevel));
+        } else {
+            basePriority = 10; // Fallback for unexpected LOD levels
         }
         
         // Add small distance-based priority (closer chunks slightly higher priority)
@@ -180,10 +188,13 @@ export class WorkerManager {
     }
 
     public getStats() {
-        // Calculate queue stats by LOD level
-        const queueByLOD = [0, 0, 0];
+        // Dynamic queue stats by LOD level
+        const config = this.configManager.getConfig();
+        const numLODs = config.lodLevels.length;
+        const queueByLOD = new Array(numLODs).fill(0);
+        
         for (const task of this.taskQueue) {
-            if (task.lodLevel >= 0 && task.lodLevel < 3) {
+            if (task.lodLevel >= 0 && task.lodLevel < numLODs) {
                 queueByLOD[task.lodLevel]++;
             }
         }

@@ -677,9 +677,6 @@ export class UIManager {
         const lodActiveRows = Array.from({length: numLODs}).map((_, i) =>
             `<div class="lod-stat">LOD${i}: <span class="lod-num">${stats.lodCounts?.[i] ?? 0}</span></div>`
         ).join("");
-        const lodPoolRows = Array.from({length: numLODs}).map((_, i) =>
-            `<div class="lod-stat">LOD${i}: <span class="lod-num">${stats.poolLodCounts?.[i] ?? 0}</span></div>`
-        ).join("");
 
         const infoContent = document.querySelector('.info-content');
         if (infoContent) {
@@ -690,8 +687,6 @@ export class UIManager {
                 <div class="stat-row"><b>Total:</b> <span class="stat-num">${stats.total}</span></div>
                 <div class="lod-row-label"><b>Active LODs</b></div>
                 <div class="lod-vertical-row">${lodActiveRows}</div>
-                <div class="lod-row-label"><b>Pooled LODs</b></div>
-                <div class="lod-vertical-row">${lodPoolRows}</div>
                 <div class="workers-row"><b>Workers:</b> <span style="color:#fb923c">${stats.workers.busyWorkers}</span> / ${stats.workers.totalWorkers}</div>
             `;
         }

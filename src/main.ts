@@ -199,7 +199,7 @@ function render() {
     const normalizedSunDir = vec3.normalize(vec3.create(), sunDirection);
     const config = uiManager.getCurrentConfig();
 
-    chunkManager.update([eye[0], eye[1], eye[2]]);
+    chunkManager.update([eye[0], eye[1], eye[2]], projView);
     chunkManager.renderAll(gl, surfaceShader, projView, [eye[0], eye[1], eye[2]], {
         sun_direction: normalizedSunDir,
         tint_lod_levels: config.tintLODLevels,
