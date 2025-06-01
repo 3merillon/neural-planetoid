@@ -47,9 +47,13 @@ export class ChunkPool {
     }
 
     private calculatePriority(chunk: Chunk, distance: number): number {
-        // Dynamic priority calculation based on available LOD levels
         const config = this.configManager.getConfig();
         const numLODs = config.lodLevels.length;
+        
+        // Empty chunks get lower priority
+        if (chunk.isEmpty) {
+            return 10; // Very low priority for empty chunks
+        }
         
         // Calculate base priority: L0 gets highest, each level gets exponentially lower
         const maxBasePriority = 1000;
@@ -106,7 +110,6 @@ export class ChunkPool {
         // If pool is full, make room using priority-based eviction
         while (this.pool.size >= this.maxSize) {
             if (!this.evictLowestPriorityChunk()) {
-                //console.warn("Could not evict any chunks - all are in use or high priority");
                 break;
             }
         }
@@ -147,11 +150,14 @@ export class ChunkPool {
         const entry = this.pool.get(key);
         
         if (entry) {
-            // Clean up GL resources
+            // Clean up GL resources (only for non-empty chunks)
             const chunk = entry.chunk;
-            if (chunk.vao) gl.deleteVertexArray(chunk.vao);
-            if (chunk.vbo) gl.deleteBuffer(chunk.vbo);
-            if (chunk.ibo) gl.deleteBuffer(chunk.ibo);
+            if (!chunk.isEmpty) {
+                if (chunk.vao) gl.deleteVertexArray(chunk.vao);
+                if (chunk.vbo) gl.deleteBuffer(chunk.vbo);
+                if (chunk.ibo) gl.deleteBuffer(chunk.ibo);
+                if (chunk.materialVbo) gl.deleteBuffer(chunk.materialVbo);
+            }
             
             this.pool.delete(key);
         }
@@ -162,10 +168,16 @@ export class ChunkPool {
         let lowestPriority = Infinity;
         let oldestTime = Infinity;
         
-        // Find the chunk with lowest priority that's not in use
+        // Prefer evicting empty chunks first
         for (const [key, entry] of this.pool) {
             if (!entry.inUse) {
-                // Prefer lower priority, then older chunks
+                // Empty chunks are always good candidates for eviction
+                if (entry.chunk.isEmpty) {
+                    lowestPriorityKey = key;
+                    break;
+                }
+                
+                // Otherwise use normal priority logic
                 if (entry.priority < lowestPriority || 
                     (entry.priority === lowestPriority && entry.lastUsed < oldestTime)) {
                     lowestPriority = entry.priority;
@@ -179,11 +191,12 @@ export class ChunkPool {
             const entry = this.pool.get(lowestPriorityKey)!;
             const chunk = entry.chunk;
             
-            // Note: GL cleanup should be handled by caller
-            this.pool.delete(lowestPriorityKey);
+            // Clean up GL resources (empty chunks have none)
+            if (!chunk.isEmpty) {
+                // Note: GL cleanup should be handled by caller for non-empty chunks
+            }
             
-            /*console.log(`Evicted LOD${chunk.lodLevel} chunk (${chunk.chunkX}, ${chunk.chunkY}, ${chunk.chunkZ}) ` +
-                       `priority: ${entry.priority.toFixed(1)}, distance: ${entry.distanceFromCamera.toFixed(1)}`);*/
+            this.pool.delete(lowestPriorityKey);
             return true;
         }
         
@@ -196,9 +209,11 @@ export class ChunkPool {
         
         let inUse = 0;
         let cached = 0;
+        let empty = 0;
         let lodCounts = new Array(numLODs).fill(0);
         let priorityStats = { min: Infinity, max: -Infinity, avg: 0 };
         let totalPriority = 0;
+        let memoryUsage = 0;
         
         for (const entry of this.pool.values()) {
             if (entry.inUse) {
@@ -207,9 +222,16 @@ export class ChunkPool {
                 cached++;
             }
             
-            // Count by LOD level
-            if (entry.chunk.lodLevel >= 0 && entry.chunk.lodLevel < numLODs) {
-                lodCounts[entry.chunk.lodLevel]++;
+            if (entry.chunk.isEmpty) {
+                empty++;
+            } else {
+                // Count by LOD level (only non-empty chunks)
+                if (entry.chunk.lodLevel >= 0 && entry.chunk.lodLevel < numLODs) {
+                    lodCounts[entry.chunk.lodLevel]++;
+                }
+                
+                // Add to memory usage
+                memoryUsage += entry.chunk.getMemoryFootprint();
             }
             
             // Priority stats
@@ -224,24 +246,29 @@ export class ChunkPool {
             total: this.pool.size,
             inUse,
             cached,
+            empty,
             maxSize: this.maxSize,
             lodCounts,
-            priorityStats
+            priorityStats,
+            memoryUsageMB: memoryUsage / (1024 * 1024)
         };
     }
 
     public cleanup(gl: WebGL2RenderingContext): void {
         for (const entry of this.pool.values()) {
             const chunk = entry.chunk;
-            if (chunk.vao) gl.deleteVertexArray(chunk.vao);
-            if (chunk.vbo) gl.deleteBuffer(chunk.vbo);
-            if (chunk.ibo) gl.deleteBuffer(chunk.ibo);
+            if (!chunk.isEmpty) {
+                if (chunk.vao) gl.deleteVertexArray(chunk.vao);
+                if (chunk.vbo) gl.deleteBuffer(chunk.vbo);
+                if (chunk.ibo) gl.deleteBuffer(chunk.ibo);
+                if (chunk.materialVbo) gl.deleteBuffer(chunk.materialVbo);
+            }
         }
         this.pool.clear();
     }
 
     // Debug method to get priority information
-    public getPriorityInfo(): Array<{key: string, lod: number, priority: number, distance: number, inUse: boolean}> {
+    public getPriorityInfo(): Array<{key: string, lod: number, priority: number, distance: number, inUse: boolean, isEmpty: boolean}> {
         const info = [];
         for (const [key, entry] of this.pool) {
             info.push({
@@ -249,7 +276,8 @@ export class ChunkPool {
                 lod: entry.chunk.lodLevel,
                 priority: entry.priority,
                 distance: entry.distanceFromCamera,
-                inUse: entry.inUse
+                inUse: entry.inUse,
+                isEmpty: entry.chunk.isEmpty
             });
         }
         return info.sort((a, b) => b.priority - a.priority); // Sort by priority descending

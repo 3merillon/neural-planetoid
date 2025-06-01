@@ -1,5 +1,6 @@
 import { Shader } from "../gl/webgl-util";
 import { mat4 } from "gl-matrix";
+import type { MaterialWeights } from "./material-system";
 
 export type ChunkState = "empty" | "generating" | "ready" | "error";
 
@@ -7,15 +8,18 @@ export class Chunk {
     public state: ChunkState = "empty";
     public meshVertices: Float32Array | null = null;
     public meshIndices: Uint32Array | null = null;
+    public materialData: Float32Array | null = null;
     public vao: WebGLVertexArrayObject | null = null;
     public vbo: WebGLBuffer | null = null;
     public ibo: WebGLBuffer | null = null;
+    public materialVbo: WebGLBuffer | null = null;
     public numIndices: number = 0;
     public lodLevel: number = 0;
     public lodColor: [number, number, number] = [1, 1, 1];
     public fadeNear: number = 1000;
     public fadeFar: number = 1200;
     public zBias: number = 0;
+    public isEmpty: boolean = false;
 
     constructor(
         public chunkX: number,
@@ -44,23 +48,65 @@ export class Chunk {
     }
 
     setupGL(gl: WebGL2RenderingContext, shader: Shader) {
-        if (!this.meshVertices || !this.meshIndices) return;
+        // Skip GL setup for empty chunks
+        if (this.isEmpty || !this.meshVertices || !this.meshIndices || this.meshIndices.length === 0) {
+            this.state = "ready";
+            return;
+        }
+        
+        // Clean up existing buffers
         if (this.vao) gl.deleteVertexArray(this.vao);
         if (this.vbo) gl.deleteBuffer(this.vbo);
         if (this.ibo) gl.deleteBuffer(this.ibo);
+        if (this.materialVbo) gl.deleteBuffer(this.materialVbo);
 
         this.vao = gl.createVertexArray();
         this.vbo = gl.createBuffer();
         this.ibo = gl.createBuffer();
+        this.materialVbo = gl.createBuffer();
+        
         gl.bindVertexArray(this.vao);
 
+        // Setup vertex data (position + normal)
         gl.bindBuffer(gl.ARRAY_BUFFER, this.vbo);
         gl.bufferData(gl.ARRAY_BUFFER, this.meshVertices, gl.STATIC_DRAW);
+        
+        // Position attribute (location 0)
         gl.enableVertexAttribArray(0);
         gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 24, 0);
+        
+        // Normal attribute (location 1)
         gl.enableVertexAttribArray(1);
         gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 24, 12);
 
+        // Setup material data (required for all chunks now)
+        if (this.materialData) {
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.materialVbo);
+            gl.bufferData(gl.ARRAY_BUFFER, this.materialData, gl.STATIC_DRAW);
+            
+            // Material weights attribute (location 2) - vec4 containing rock, grass, dirt, sand weights
+            gl.enableVertexAttribArray(2);
+            gl.vertexAttribPointer(2, 4, gl.FLOAT, false, 0, 0);
+        } else {
+            // Create default material weights (all rock)
+            const numVertices = this.meshVertices.length / 6; // 6 floats per vertex (3 pos + 3 normal)
+            const defaultMaterialData = new Float32Array(numVertices * 4);
+            for (let i = 0; i < numVertices; i++) {
+                const offset = i * 4;
+                defaultMaterialData[offset] = 1.0;     // rock
+                defaultMaterialData[offset + 1] = 0.0; // grass
+                defaultMaterialData[offset + 2] = 0.0; // dirt
+                defaultMaterialData[offset + 3] = 0.0; // sand
+            }
+            
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.materialVbo);
+            gl.bufferData(gl.ARRAY_BUFFER, defaultMaterialData, gl.STATIC_DRAW);
+            
+            gl.enableVertexAttribArray(2);
+            gl.vertexAttribPointer(2, 4, gl.FLOAT, false, 0, 0);
+        }
+
+        // Setup indices
         gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.ibo);
         gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, this.meshIndices, gl.STATIC_DRAW);
 
@@ -69,11 +115,15 @@ export class Chunk {
     }
 
     render(gl: WebGL2RenderingContext, shader: Shader, projView: mat4, eye: [number,number,number], uniforms: any) {
-        if (this.state !== "ready" || !this.vao) return;
+        // Early exit for empty chunks
+        if (this.isEmpty || this.state !== "ready" || !this.vao || this.numIndices === 0) {
+            return;
+        }
+        
         gl.bindVertexArray(this.vao);
         shader.use(gl);
 
-        // Only set uniforms that exist in the shader
+        // Set standard uniforms
         if (shader.uniforms["proj_view"]) {
             gl.uniformMatrix4fv(shader.uniforms["proj_view"], false, projView);
         }
@@ -101,6 +151,8 @@ export class Chunk {
         if (shader.uniforms["eye_pos"]) {
             gl.uniform3fv(shader.uniforms["eye_pos"], eye);
         }
+
+        // Set other uniforms
         if (shader.uniforms["volume_dims"]) {
             gl.uniform3iv(shader.uniforms["volume_dims"], [this.worldSize, this.worldSize, this.worldSize]);
         }
@@ -132,5 +184,52 @@ export class Chunk {
 
         gl.drawElements(gl.TRIANGLES, this.numIndices, gl.UNSIGNED_INT, 0);
         gl.bindVertexArray(null);
+    }
+
+    // Set material data for this chunk
+    setMaterialData(materialWeights: MaterialWeights[]): void {
+        if (!materialWeights || materialWeights.length === 0) {
+            this.materialData = null;
+            return;
+        }
+
+        // Convert material weights to Float32Array (4 floats per vertex: rock, grass, dirt, sand)
+        this.materialData = new Float32Array(materialWeights.length * 4);
+        
+        for (let i = 0; i < materialWeights.length; i++) {
+            const weights = materialWeights[i];
+            const offset = i * 4;
+            this.materialData[offset] = weights.rock;
+            this.materialData[offset + 1] = weights.grass;
+            this.materialData[offset + 2] = weights.dirt;
+            this.materialData[offset + 3] = weights.sand;
+        }
+    }
+
+    // Get memory footprint for pool management
+    getMemoryFootprint(): number {
+        if (this.isEmpty) return 0;
+        
+        let size = 0;
+        if (this.meshVertices) size += this.meshVertices.byteLength;
+        if (this.meshIndices) size += this.meshIndices.byteLength;
+        if (this.materialData) size += this.materialData.byteLength;
+        return size;
+    }
+
+    cleanup(gl: WebGL2RenderingContext): void {
+        // Only clean up if we actually allocated resources
+        if (!this.isEmpty) {
+            if (this.vao) gl.deleteVertexArray(this.vao);
+            if (this.vbo) gl.deleteBuffer(this.vbo);
+            if (this.ibo) gl.deleteBuffer(this.ibo);
+            if (this.materialVbo) gl.deleteBuffer(this.materialVbo);
+        }
+        
+        this.vao = null;
+        this.vbo = null;
+        this.ibo = null;
+        this.materialVbo = null;
+        this.materialData = null;
     }
 }

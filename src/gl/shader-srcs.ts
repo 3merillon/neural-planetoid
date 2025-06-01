@@ -1,16 +1,20 @@
 export const isosurfaceVertShader = `#version 300 es
 layout(location=0) in vec3 pos;
 layout(location=1) in vec3 normal;
+layout(location=2) in vec4 material_weights;
+
 uniform mat4 proj_view;
 uniform int lod_level;
 uniform float z_bias_factor;
 
 out vec3 vpos;
 out vec3 vnormal;
+out vec4 vertex_material_weights;
 
 void main(void) {
     vpos = pos;
     vnormal = normal;
+    vertex_material_weights = material_weights;
     
     vec4 clip_pos = proj_view * vec4(pos, 1.0);
     
@@ -45,19 +49,16 @@ uniform bool enable_triplanar;
 
 in vec3 vpos;
 in vec3 vnormal;
+in vec4 vertex_material_weights; // rock, grass, dirt, sand
 
 out vec4 color;
-
-// Planet constants (should match your density.ts values)
-const vec3 PLANET_CENTER = vec3(0.0, 0.0, 0.0);
-const float PLANET_RADIUS = 80.0;
 
 // Convert sRGB to linear for proper lighting calculations
 vec3 srgb_to_linear(vec3 c) {
     return pow(c, vec3(2.2));
 }
 
-// Improved triplanar blending weights
+// Triplanar blending weights
 vec3 calculate_triplanar_weights(vec3 normal) {
     vec3 abs_normal = abs(normal);
     abs_normal = pow(abs_normal, vec3(4.0));
@@ -65,99 +66,7 @@ vec3 calculate_triplanar_weights(vec3 normal) {
     return sum > 0.001 ? abs_normal / sum : vec3(0.0, 1.0, 0.0);
 }
 
-// Calculate material weights based on spherical planetoid features
-vec4 calculate_material_weights(vec3 world_pos, vec3 world_normal) {
-    // Calculate radial direction from planet center
-    vec3 to_center = PLANET_CENTER - world_pos;
-    vec3 radial_dir = normalize(to_center);
-    float distance_from_center = length(to_center);
-    
-    // Calculate how much the surface normal aligns with the radial direction
-    // dot = 1.0 means surface is perpendicular to radius (flat relative to planet)
-    // dot = 0.0 means surface is parallel to radius (cliff/steep slope)
-    float surface_alignment = abs(dot(world_normal, radial_dir));
-    
-    // Calculate "slope" - how steep the surface is relative to the planet's curvature
-    // 0.0 = flat relative to planet surface, 1.0 = vertical cliff
-    float slope = 1.0 - surface_alignment;
-    
-    // Calculate altitude relative to planet surface
-    float altitude = distance_from_center - PLANET_RADIUS;
-    
-    // Calculate latitude-like effect (distance from equatorial plane)
-    float latitude_factor = abs(world_pos.y) / PLANET_RADIUS;
-    
-    // Material assignment based on planetoid features:
-    
-    // ROCK: Steep slopes (cliffs, overhangs) and high altitude areas
-    float rock_weight = smoothstep(0.25, 0.6, slope) + 
-                       smoothstep(10.0, 20.0, altitude) * 0.9 +
-                       smoothstep(0.6, 0.8, latitude_factor) * 0.6; // More rock at "poles"
-    
-    // GRASS: Flat areas at moderate altitude with some latitude variation
-    float grass_weight = smoothstep(0.7, 0.3, slope) * 
-                        smoothstep(-2.0, 12.0, altitude) * 
-                        smoothstep(0.7, 0.2, latitude_factor) * // Less grass at poles
-                        smoothstep(15.0, 5.0, altitude); // Fade out grass at high altitude
-    
-    // DIRT: Medium slopes and transition zones, broader altitude range
-    float dirt_weight = smoothstep(0.15, 0.5, slope) * 
-                       smoothstep(0.5, 0.15, slope) * 
-                       smoothstep(-8.0, 25.0, altitude) +
-                       // Additional dirt in transition zones
-                       smoothstep(0.4, 0.7, slope) * smoothstep(0.7, 0.4, slope) * 0.3;
-    
-    // SAND: Smoother transitions to prevent abrupt edges
-    // Future sea level around altitude -5 to +2
-    float sea_level_factor = smoothstep(5.0, -3.0, altitude) * smoothstep(-3.0, -10.0, altitude);
-    float flat_factor = smoothstep(0.5, 0.05, slope); // Gentler slope requirement
-    float coastal_factor = smoothstep(0.6, 0.15, latitude_factor); // Smoother latitude transition
-    
-    float sand_weight = sea_level_factor * flat_factor * coastal_factor * 0.7;
-    
-    // Add noise variation for natural look (using world position)
-    float noise1 = sin(world_pos.x * 0.04) * sin(world_pos.z * 0.04) * 0.25 + 0.75;
-    float noise2 = sin(world_pos.x * 0.07 + 50.0) * sin(world_pos.y * 0.07) * 0.2 + 0.8;
-    float noise3 = sin(world_pos.x * 0.03) * sin(world_pos.z * 0.03) * 0.3 + 0.7;
-    
-    // Apply noise to create natural variation
-    grass_weight *= noise1;
-    dirt_weight *= noise2;
-    rock_weight *= noise3;
-    
-    // Sand gets smoother noise treatment to prevent hard edges
-    float sand_noise = sin(world_pos.x * 0.02) * sin(world_pos.z * 0.02) * 0.4 + 0.6;
-    sand_weight *= sand_noise; // Smoother variation instead of hard cutoff
-    
-    // Add some random rock outcrops
-    float rock_patch_noise = sin(world_pos.x * 0.015) * sin(world_pos.y * 0.015) * sin(world_pos.z * 0.015);
-    float rock_outcrop = smoothstep(0.7, 0.8, rock_patch_noise); // Smoother rock patches
-    rock_weight += rock_outcrop * 0.4;
-    sand_weight *= (1.0 - rock_outcrop * 0.8); // Smoothly reduce sand where rock outcrops appear
-    
-    // Smooth altitude-based sand reduction instead of hard cutoff
-    sand_weight *= smoothstep(8.0, 3.0, altitude); // Gentler high-altitude fade
-    
-    // Add subtle blending between materials to soften transitions
-    float blend_strength = 0.15;
-    float avg_weight = (rock_weight + grass_weight + dirt_weight) / 3.0;
-    rock_weight = mix(rock_weight, avg_weight, blend_strength * 0.3);
-    grass_weight = mix(grass_weight, avg_weight, blend_strength * 0.4);
-    dirt_weight = mix(dirt_weight, avg_weight, blend_strength * 0.5);
-    
-    // Ensure we have some minimum material presence (except sand)
-    rock_weight = max(rock_weight, 0.08);
-    grass_weight = max(grass_weight, 0.04);
-    dirt_weight = max(dirt_weight, 0.08);
-    sand_weight = max(sand_weight, 0.01); // Sand can be completely absent
-    
-    // Normalize weights
-    vec4 weights = vec4(rock_weight, grass_weight, dirt_weight, sand_weight);
-    float total = weights.x + weights.y + weights.z + weights.w;
-    return total > 0.001 ? weights / total : vec4(0.4, 0.3, 0.3, 0.0);
-}
-
-// Triplanar diffuse sampling - only samples materials with significant weight
+// Triplanar diffuse sampling - using vertex materials
 vec3 triplanar_diffuse_multi(vec3 world_pos, vec3 world_normal, float scale, vec4 material_weights) {
     vec3 blend_weights = calculate_triplanar_weights(world_normal);
     vec3 final_color = vec3(0.0);
@@ -179,7 +88,7 @@ vec3 triplanar_diffuse_multi(vec3 world_pos, vec3 world_normal, float scale, vec
     return final_color;
 }
 
-// Triplanar normal sampling - only samples materials with significant weight
+// Triplanar normal sampling
 vec3 triplanar_normal_multi(vec3 world_pos, vec3 world_normal, float scale, vec4 material_weights) {
     vec3 blend_weights = calculate_triplanar_weights(world_normal);
     vec3 final_normal = vec3(0.0);
@@ -229,7 +138,7 @@ vec3 triplanar_normal_multi(vec3 world_pos, vec3 world_normal, float scale, vec4
     return normalize(mix(world_normal, final_normal, 0.8));
 }
 
-// Triplanar roughness sampling - only samples materials with significant weight
+// Triplanar roughness sampling
 float triplanar_roughness_multi(vec3 world_pos, vec3 world_normal, float scale, vec4 material_weights) {
     vec3 blend_weights = calculate_triplanar_weights(world_normal);
     float final_roughness = 0.0;
@@ -312,18 +221,18 @@ void main(void) {
         if (should_discard) discard;
     }
 
-    // Material sampling and lighting
+    // Material sampling and lighting using vertex materials
     vec3 base_color;
     vec3 surface_normal;
     float roughness;
     
     if (enable_triplanar) {
         float texture_scale = 0.1;
-        vec4 material_weights = calculate_material_weights(vpos, normalize(vnormal));
         
-        base_color = triplanar_diffuse_multi(vpos, normalize(vnormal), texture_scale, material_weights);
-        surface_normal = triplanar_normal_multi(vpos, normalize(vnormal), texture_scale, material_weights);
-        roughness = triplanar_roughness_multi(vpos, normalize(vnormal), texture_scale, material_weights);
+        // Use vertex material weights directly
+        base_color = triplanar_diffuse_multi(vpos, normalize(vnormal), texture_scale, vertex_material_weights);
+        surface_normal = triplanar_normal_multi(vpos, normalize(vnormal), texture_scale, vertex_material_weights);
+        roughness = triplanar_roughness_multi(vpos, normalize(vnormal), texture_scale, vertex_material_weights);
     } else {
         base_color = vec3(0.8);
         surface_normal = normalize(vnormal);

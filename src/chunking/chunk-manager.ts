@@ -6,6 +6,7 @@ import { ChunkConfigManager, type LODLevel, type WorldLODConfig } from "./chunk-
 import { WorkerManager } from "./worker-manager";
 import { ChunkPool } from "./chunk-pool";
 import { Frustum, createAABBForChunk, FrustumResult } from "./frustum-culling";
+import { MaterialSystem, type MaterialWeights } from "./material-system";
 
 function chunkKey(x: number, y: number, z: number, worldSize: number): string {
   return `${x},${y},${z},${worldSize}`;
@@ -26,6 +27,7 @@ export class ChunkManager {
   private workerManager: WorkerManager;
   private chunkPool: ChunkPool;
   private frustum: Frustum;
+  private lastRenderStats = { emptyChunks: 0, renderedChunks: 0 };
 
   public chunks = new Map<string, Chunk>();
   private pending = new Set<string>();
@@ -279,47 +281,84 @@ export class ChunkManager {
     lodLevel: LODLevel
   ) {
     try {
-      this.marchingCubes.set_volume(volume, voxelGridSize+1, voxelGridSize+1, voxelGridSize+1);
-      const mesh = this.marchingCubes.marching_cubes_indexed_pos(0.5);
-      const positions = Reflect.get(mesh, "vertices")   as Float32Array;
-      const indices   = Reflect.get(mesh, "indices")    as Uint32Array;
-      const [ox,oy,oz] = chunk.getWorldOrigin();
-      const vsize      = lodLevel.worldSize / voxelGridSize;
+        this.marchingCubes.set_volume(volume, voxelGridSize+1, voxelGridSize+1, voxelGridSize+1);
+        const mesh = this.marchingCubes.marching_cubes_indexed_pos(0.5);
+        const positions = Reflect.get(mesh, "vertices") as Float32Array;
+        const indices = Reflect.get(mesh, "indices") as Uint32Array;
+        
+        // Handle empty chunks efficiently
+        if (!positions || positions.length === 0 || !indices || indices.length === 0) {
+            chunk.isEmpty = true;
+            chunk.state = "ready";
+            // Don't call setupGL - no resources to allocate
+            return;
+        }
+        
+        const [ox, oy, oz] = chunk.getWorldOrigin();
+        const vsize = lodLevel.worldSize / voxelGridSize;
 
-      // world‐position + normals
-      const worldPos = new Float32Array(positions.length);
-      for(let i=0;i<positions.length;i+=3){
-        worldPos[i]   = positions[i]   * vsize + ox;
-        worldPos[i+1] = positions[i+1] * vsize + oy;
-        worldPos[i+2] = positions[i+2] * vsize + oz;
-      }
-      const seed = this.configManager.getSeed();
-      const iso  = this.configManager.getIsoLevelBias() + lodLevel.isoOffset;
-      const normals = computeNormalsFieldGradientJS(
-        worldPos, seed, iso, 0.5*vsize
-      );
+        // World-position + normals
+        const worldPos = new Float32Array(positions.length);
+        for(let i = 0; i < positions.length; i += 3) {
+            worldPos[i] = positions[i] * vsize + ox;
+            worldPos[i+1] = positions[i+1] * vsize + oy;
+            worldPos[i+2] = positions[i+2] * vsize + oz;
+        }
+        
+        const seed = this.configManager.getSeed();
+        const iso = this.configManager.getIsoLevelBias() + lodLevel.isoOffset;
+        const normals = computeNormalsFieldGradientJS(
+            worldPos, seed, iso, 0.5 * vsize
+        );
 
-      // interleave
-      const inter = new Float32Array((worldPos.length/3)*6);
-      for(let i=0,j=0;i<worldPos.length;i+=3,j+=6){
-        inter[j]=worldPos[i];
-        inter[j+1]=worldPos[i+1];
-        inter[j+2]=worldPos[i+2];
-        inter[j+3]=normals[i];
-        inter[j+4]=normals[i+1];
-        inter[j+5]=normals[i+2];
-      }
-      chunk.meshVertices = inter;
-      chunk.meshIndices  = indices;
-      chunk.state = "ready";
-      chunk.setupGL(this.gl, this.shader);
-    } catch(e){
-      chunk.state = "error";
-      console.error("Chunk process error", e);
+        // Calculate material data for each vertex
+        const materialWeights: MaterialWeights[] = [];
+        const numVertices = worldPos.length / 3;
+        
+        for (let i = 0; i < numVertices; i++) {
+            const vertexIndex = i * 3;
+            const worldPosition: [number, number, number] = [
+                worldPos[vertexIndex],
+                worldPos[vertexIndex + 1],
+                worldPos[vertexIndex + 2]
+            ];
+            
+            const worldNormal: [number, number, number] = [
+                normals[vertexIndex],
+                normals[vertexIndex + 1],
+                normals[vertexIndex + 2]
+            ];
+
+            // Calculate material weights using the cleaned up logic
+            const weights = MaterialSystem.calculateMaterialWeights(worldPosition, worldNormal);
+            materialWeights.push(weights);
+        }
+
+        // Interleave position and normal data
+        const inter = new Float32Array((worldPos.length / 3) * 6);
+        for(let i = 0, j = 0; i < worldPos.length; i += 3, j += 6) {
+            inter[j] = worldPos[i];
+            inter[j+1] = worldPos[i+1];
+            inter[j+2] = worldPos[i+2];
+            inter[j+3] = normals[i];
+            inter[j+4] = normals[i+1];
+            inter[j+5] = normals[i+2];
+        }
+        
+        chunk.meshVertices = inter;
+        chunk.meshIndices = indices;
+        chunk.setMaterialData(materialWeights);
+        chunk.isEmpty = false;
+        
+        chunk.state = "ready";
+        chunk.setupGL(this.gl, this.shader);
+    } catch(e) {
+        chunk.state = "error";
+        console.error("Chunk process error", e);
     }
   }
 
-  // Render all chunks
+  // Optimized render method
   public renderAll(
     gl: WebGL2RenderingContext,
     shader: any,
@@ -335,14 +374,26 @@ export class ChunkManager {
       z_bias_factor:    cfg.zBiasFactor
     };
 
-    // bucket chunks by LOD - dynamic array size
+    // Bucket chunks by LOD - only include non-empty chunks
     const buckets: Chunk[][] = Array(cfg.lodLevels.length).fill(null).map(()=>[]);
+    let emptyChunks = 0;
+    let renderedChunks = 0;
+    
     for(const c of this.chunks.values()){
-      if(c.state==="ready" && c.lodLevel>=0 && c.lodLevel<cfg.lodLevels.length){
-        buckets[c.lodLevel].push(c);
+      if(c.state === "ready" && c.lodLevel >= 0 && c.lodLevel < cfg.lodLevels.length){
+        if (!c.isEmpty && c.numIndices > 0) {
+          buckets[c.lodLevel].push(c);
+          renderedChunks++;
+        } else {
+          emptyChunks++;
+        }
       }
     }
-    // draw coarsest→finest
+    
+    // Store stats for debugging
+    this.lastRenderStats = { emptyChunks, renderedChunks };
+    
+    // Draw coarsest→finest (only non-empty chunks)
     for(let lod=buckets.length-1;lod>=0;lod--){
       for(const c of buckets[lod]){
         c.render(gl, shader, projView, eye, ext);
@@ -355,25 +406,29 @@ export class ChunkManager {
     const cfg = this.configManager.getConfig();
     const ws = this.workerManager.getStats();
     const ps = this.chunkPool.getStats();
-    let ready=0, gen=0, err=0;
+    let ready = 0, gen = 0, err = 0, empty = 0;
     const lodCounts = new Array(cfg.lodLevels.length).fill(0);
 
     for(const c of this.chunks.values()){
-      if(c.state==="ready") {
+      if(c.state === "ready") {
         ready++;
-        if (c.lodLevel >= 0 && c.lodLevel < cfg.lodLevels.length) {
-          lodCounts[c.lodLevel] = (lodCounts[c.lodLevel]||0)+1;
+        if (c.isEmpty) {
+          empty++;
+        } else if (c.lodLevel >= 0 && c.lodLevel < cfg.lodLevels.length) {
+          lodCounts[c.lodLevel] = (lodCounts[c.lodLevel] || 0) + 1;
         }
-      } else if(c.state==="generating") gen++;
-      else if(c.state==="error") err++;
+      } else if(c.state === "generating") gen++;
+      else if(c.state === "error") err++;
     }
+    
     return {
-      ready, gen, err,
+      ready, gen, err, empty,
       total: this.chunks.size,
       pending: this.pending.size,
       lodCounts,
       pool: ps,
-      workers: ws
+      workers: ws,
+      lastRender: this.lastRenderStats
     };
   }
 
