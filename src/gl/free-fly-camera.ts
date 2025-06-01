@@ -248,6 +248,11 @@ export class FreeFlyCamera {
         }
 
         let move = vec3.create();
+        
+        // Check for speed boost (shift key)
+        const speedMultiplier = (this.keys.has("shiftleft") || this.keys.has("shiftright")) ? 3.0 : 1.0;
+        
+        // Movement controls
         if (this.keys.has("keyw") || this.keys.has("arrowup")) {
             vec3.add(move, move, this.getForward());
         }
@@ -263,13 +268,13 @@ export class FreeFlyCamera {
         if (this.keys.has("space")) {
             vec3.add(move, move, this.getUp());
         }
-        if (this.keys.has("shiftleft") || this.keys.has("shift")) {
+        if (this.keys.has("controlleft") || this.keys.has("controlright")) {
             vec3.sub(move, move, this.getUp());
         }
         
         if (vec3.length(move) > 0.0001) {
             vec3.normalize(move, move);
-            vec3.scale(move, move, this.moveSpeed * dt);
+            vec3.scale(move, move, this.moveSpeed * speedMultiplier * dt);
 
             if (this.restrictToIsosurface && this.densityAt) {
                 this.position = this.applySoftBallConstraint(this.position, move);

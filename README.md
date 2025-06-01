@@ -90,7 +90,8 @@ npm run preview
 - WASD / Arrow keys: Move
 - Mouse drag: Look around
 - Q / E: Roll
-- Space / Shift: Up / Down
+- Space / Ctrl: Up / Down
+- Shift: 3x Speed
 - Pinch / Touch: Move and look on mobile
 
 ---
