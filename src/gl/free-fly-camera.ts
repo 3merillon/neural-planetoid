@@ -250,7 +250,7 @@ export class FreeFlyCamera {
         let move = vec3.create();
         
         // Check for speed boost (shift key)
-        const speedMultiplier = (this.keys.has("shiftleft") || this.keys.has("shiftright")) ? 3.0 : 1.0;
+        const speedMultiplier = (this.keys.has("shiftleft") || this.keys.has("shiftright")) ? 5.0 : 1.0;
         
         // Movement controls
         if (this.keys.has("keyw") || this.keys.has("arrowup")) {
@@ -268,7 +268,7 @@ export class FreeFlyCamera {
         if (this.keys.has("space")) {
             vec3.add(move, move, this.getUp());
         }
-        if (this.keys.has("controlleft") || this.keys.has("controlright")) {
+        if (this.keys.has("keyc")) {
             vec3.sub(move, move, this.getUp());
         }
         

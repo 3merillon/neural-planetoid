@@ -1,5 +1,4 @@
 import { densityAtSeeded } from "./density";
-import { ChunkConfigManager } from "./chunk-config";
 
 export function computeNormalsFieldGradientJS(
     positions: Float32Array,

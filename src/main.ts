@@ -7,17 +7,17 @@ import { loadTextureArray } from "./gl/texture-loader";
 import { PLANET_RADIUS, densityAtSeeded } from "./chunking/density";
 import { SkyboxRenderer } from "./gl/skybox-renderer";
 import { SunRenderer } from "./gl/sun-renderer";
-import { ChunkManager } from "./chunking/chunk-manager";
-import { ChunkConfigManager } from "./chunking/chunk-config";
+import { ChunkConfigManager, type WorldGenerationConfig } from "./chunking/chunk-config";
 import { UIManager } from "./ui/ui-manager";
 import { AudioManager } from "./audio/audio-manager";
+import { OctreeChunkManager } from "./chunking/octree-chunk-manager";
 import "./style.css";
 
 let WIDTH = window.innerWidth, HEIGHT = window.innerHeight;
 const sunDirection: [number, number, number] = [-0.3, -0.8, -0.5];
 
 let marchingCubes: MarchingCubes;
-let chunkManager: ChunkManager;
+let octreeChunkManager: OctreeChunkManager;
 let canvas: HTMLCanvasElement;
 let gl: WebGL2RenderingContext | null = null;
 let camera: FreeFlyCamera;
@@ -88,7 +88,7 @@ function setupGL() {
         [0, 1, 0],
         {
             restrictToIsosurface: restrictToIsosurface,
-            isosurfaceBuffer: -0.9,
+            isosurfaceBuffer: -0.5,
             densityAt: (x, y, z) => densityAtSeeded(x, y, z, seed, isoLevelBias),
         }
     );
@@ -100,12 +100,11 @@ function setupGL() {
     surfaceShader = new Shader(gl, isosurfaceVertShader, isosurfaceFragShader);
     skyboxRenderer = new SkyboxRenderer(gl);
 
-    // Setup sun renderer
     sunRenderer = new SunRenderer(gl);
     sunRenderer.setSunDirection(vec3.fromValues(...sunDirection));
     sunRenderer.sunSize = 160.0;
     sunRenderer.sunIntensity = 1.4;
-    vec3.set(sunRenderer.sunColor, 1.0, 0.0, 0.0); // Red sun
+    vec3.set(sunRenderer.sunColor, 1.0, 0.0, 0.0);
 
     gl.enable(gl.CULL_FACE);
     gl.cullFace(gl.BACK);
@@ -130,26 +129,21 @@ function render() {
     const eye = camera.position;
     gl.viewport(0, 0, WIDTH, HEIGHT);
 
-    // Clear both color and depth buffers
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
-    // --- RENDER SKYBOX FIRST ---
     if (skyboxRenderer && skyboxRenderer.isReady()) {
         skyboxRenderer.render(camera.viewMatrix, camera.projectionMatrix);
     }
 
-    // --- RENDER SUN ---
     if (sunRenderer) {
-        // Calculate billboard orientation for roll-aligned billboard
         const sunToCamera = vec3.create();
         vec3.subtract(sunToCamera, camera.position, sunRenderer.sunPosition);
         vec3.normalize(sunToCamera, sunToCamera);
 
         const camUp = camera.getUp();
         const projUp = vec3.create();
-        // Project camUp onto the plane perpendicular to sunToCamera
         const dot = vec3.dot(camUp, sunToCamera);
-        vec3.scaleAndAdd(projUp, camUp, sunToCamera, -dot); // camUp - dot * sunToCamera
+        vec3.scaleAndAdd(projUp, camUp, sunToCamera, -dot);
         vec3.normalize(projUp, projUp);
 
         const right = vec3.create();
@@ -172,10 +166,8 @@ function render() {
         );
     }
 
-    // --- RESTORE AND ACTIVATE TERRAIN SHADER ---
     surfaceShader.use(gl);
 
-    // --- BIND MATERIAL TEXTURES FOR TERRAIN ---
     if (materialDiffuseArray && materialNormalArray && materialRoughnessArray) {
         gl.activeTexture(gl.TEXTURE0);
         gl.bindTexture(gl.TEXTURE_2D_ARRAY, materialDiffuseArray);
@@ -199,13 +191,13 @@ function render() {
     const normalizedSunDir = vec3.normalize(vec3.create(), sunDirection);
     const config = uiManager.getCurrentConfig();
 
-    chunkManager.update([eye[0], eye[1], eye[2]], projView);
-    chunkManager.renderAll(gl, surfaceShader, projView, [eye[0], eye[1], eye[2]], {
+    octreeChunkManager.update([eye[0], eye[1], eye[2]], projView);
+    octreeChunkManager.renderAll(gl, surfaceShader, projView, [eye[0], eye[1], eye[2]], {
         sun_direction: normalizedSunDir,
         tint_lod_levels: config.tintLODLevels,
         enable_triplanar: config.enableTriplanar
     });
-    
+
     uiManager.updateInfoPanel();
 }
 
@@ -223,16 +215,26 @@ function animationLoop() {
 }
 
 async function regenerateWorld() {
-    if (chunkManager) chunkManager.cleanup();
+    if (octreeChunkManager) octreeChunkManager.cleanup();
 
     const config = uiManager.getCurrentConfig();
-    const configManager = ChunkConfigManager.createWorld(config as any);
+    const worldGenConfig: WorldGenerationConfig = {
+        seed: config.seed,
+        voxelResolution: config.voxelResolution,
+        numLODLevels: config.numLODLevels,
+        rootSizeMultiplier: config.rootSizeMultiplier,
+        zBiasFactor: config.zBiasFactor,
+        isoLevelBias: config.isoLevelBias,
+        fadeOverlapFactor: config.fadeOverlapFactor,
+        maxChunks: config.maxChunks,
+        maxWorkers: config.maxWorkers,
+        lodDistanceFactor: config.lodDistanceFactor
+    };
+    const configManager = ChunkConfigManager.createWorld(worldGenConfig);
     configManager.setZBiasFactor(config.zBiasFactor);
     configManager.setIsoLevelBias(config.isoLevelBias);
     configManager.setSeed(config.seed);
-    configManager.setDitheringEnabled(config.dithering);
 
-    // Update audio with new seed if initialized
     if (hasUserInteracted && audioManager) {
         audioManager.setSeed(config.seed);
     }
@@ -245,11 +247,13 @@ async function regenerateWorld() {
         }
     }
 
-    chunkManager = new ChunkManager(marchingCubes, gl!, surfaceShader, {
+    octreeChunkManager = new OctreeChunkManager(marchingCubes, gl!, surfaceShader, {
         sun_direction: vec3.normalize(vec3.create(), sunDirection),
         tint_lod_levels: config.tintLODLevels,
         enable_triplanar: config.enableTriplanar
     });
+
+    octreeChunkManager.onConfigChanged();
 
     if (camera) {
         const seed = configManager.getSeed();
@@ -257,50 +261,55 @@ async function regenerateWorld() {
         camera.setDensityAt((x, y, z) => densityAtSeeded(x, y, z, seed, isoLevelBias));
     }
     camera.setRestrictToIsosurface(uiManager.getCurrentConfig().enableCollision);
-    uiManager.setChunkManager(chunkManager);
+    uiManager.setChunkManager(octreeChunkManager);
 }
 
 window.onload = async function() {
     uiManager = new UIManager();
     audioManager = new AudioManager();
-    
-    // Add volume change callback
+
+    uiManager.setOnBackfaceCullingToggledCallback((enabled: boolean) => {
+        if (gl) {
+            if (enabled) {
+                gl.enable(gl.CULL_FACE);
+            } else {
+                gl.disable(gl.CULL_FACE);
+            }
+        }
+    });
+
     uiManager.setOnVolumeChangeCallback((volume: number) => {
         if (audioManager) {
             audioManager.setVolume(volume);
         }
     });
-    
+
     uiManager.setOnCollisionToggledCallback((enabled: boolean) => {
         if (camera) {
             camera.setRestrictToIsosurface(enabled);
         }
     });
-    
+
     uiManager.setOnRegenerateCallback(async () => {
         await regenerateWorld();
-        // Update audio with new seed
         const config = uiManager.getCurrentConfig();
         if (audioManager) {
             audioManager.setSeed(config.seed);
         }
     });
 
-    // Setup user interaction detection for audio
     const startAudioOnInteraction = async () => {
         if (!hasUserInteracted) {
             hasUserInteracted = true;
             const config = uiManager.getCurrentConfig();
             await audioManager.initialize(config.seed);
             await audioManager.startMusic();
-            
-            // Remove listeners after first interaction
             document.removeEventListener('click', startAudioOnInteraction);
             document.removeEventListener('touchstart', startAudioOnInteraction);
             document.removeEventListener('keydown', startAudioOnInteraction);
         }
     };
-    
+
     document.addEventListener('click', startAudioOnInteraction);
     document.addEventListener('touchstart', startAudioOnInteraction);
     document.addEventListener('keydown', startAudioOnInteraction);
@@ -312,41 +321,32 @@ window.onload = async function() {
     await skyboxRenderer.loadSkybox();
     lastRenderTime = performance.now();
 
-    // Load multi-material texture arrays
     try {
-        //console.log("Loading material texture arrays...");
-        
         materialDiffuseArray = await loadTextureArray(gl!, [
             'textures/rock_diff.jpg',
             'textures/grass_diff.jpg', 
             'textures/dirt_diff.jpg',
             'textures/sand_diff.jpg'
         ]);
-        
         materialNormalArray = await loadTextureArray(gl!, [
             'textures/rock_norm.jpg',
             'textures/grass_norm.jpg', 
             'textures/dirt_norm.jpg',
             'textures/sand_norm.jpg'
         ]);
-        
         materialRoughnessArray = await loadTextureArray(gl!, [
             'textures/rock_rough.jpg',
             'textures/grass_rough.jpg', 
             'textures/dirt_rough.jpg',
             'textures/sand_rough.jpg'
         ]);
-        
-        //console.log("Material textures loaded successfully!");
-    } catch (e) {
-        //console.warn("Could not load material textures:", e);
-    }
+    } catch (e) {}
 
     await regenerateWorld();
-    uiManager.setChunkManager(chunkManager);
+    uiManager.setChunkManager(octreeChunkManager);
 
     window.addEventListener('beforeunload', () => {
-        if (chunkManager) chunkManager.cleanup();
+        if (octreeChunkManager) octreeChunkManager.cleanup();
         if (sunRenderer) sunRenderer.cleanup();
         if (audioManager) audioManager.cleanup();
     });

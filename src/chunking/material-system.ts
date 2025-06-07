@@ -7,7 +7,35 @@ export interface MaterialWeights {
 
 export class MaterialSystem {
     private static readonly PLANET_CENTER = [0, 0, 0];
-    private static readonly PLANET_RADIUS = 80;
+    private static readonly PLANET_RADIUS = 800;
+    private static readonly NOISE_RANGE = 200;
+
+    // Higher amplitude, higher frequency for bubbly inclusions
+    private static noise(x: number, y: number, z: number, freq: number, seed: number): number {
+        const ix = Math.floor(x * freq), iy = Math.floor(y * freq), iz = Math.floor(z * freq);
+        const fx = x * freq - ix, fy = y * freq - iy, fz = z * freq - iz;
+        function hash(a: number, b: number, c: number, s: number) {
+            let h = a * 374761393 + b * 668265263 + c * 2147483647 + s * 2654435761;
+            h = (h ^ (h >> 13)) * 1274126177;
+            return ((h ^ (h >> 16)) & 0x7fffffff) / 0x7fffffff;
+        }
+        function lerp(a: number, b: number, t: number) { return a + (b-a)*t; }
+        const v000 = hash(ix, iy, iz, seed);
+        const v100 = hash(ix+1, iy, iz, seed);
+        const v010 = hash(ix, iy+1, iz, seed);
+        const v110 = hash(ix+1, iy+1, iz, seed);
+        const v001 = hash(ix, iy, iz+1, seed);
+        const v101 = hash(ix+1, iy, iz+1, seed);
+        const v011 = hash(ix, iy+1, iz+1, seed);
+        const v111 = hash(ix+1, iy+1, iz+1, seed);
+        const v00 = lerp(v000, v100, fx);
+        const v01 = lerp(v001, v101, fx);
+        const v10 = lerp(v010, v110, fx);
+        const v11 = lerp(v011, v111, fx);
+        const v0 = lerp(v00, v10, fy);
+        const v1 = lerp(v01, v11, fy);
+        return lerp(v0, v1, fz);
+    }
 
     public static calculateMaterialWeights(
         worldPos: [number, number, number],
@@ -16,134 +44,71 @@ export class MaterialSystem {
         const [x, y, z] = worldPos;
         const [nx, ny, nz] = worldNormal;
 
-        // Calculate radial direction from planet center
+        const R = MaterialSystem.PLANET_RADIUS;
+        const N = MaterialSystem.NOISE_RANGE;
+
         const toCenterX = MaterialSystem.PLANET_CENTER[0] - x;
         const toCenterY = MaterialSystem.PLANET_CENTER[1] - y;
         const toCenterZ = MaterialSystem.PLANET_CENTER[2] - z;
-        
         const distanceFromCenter = Math.sqrt(toCenterX * toCenterX + toCenterY * toCenterY + toCenterZ * toCenterZ);
-        
-        // Normalize radial direction
-        const radialDirX = toCenterX / distanceFromCenter;
-        const radialDirY = toCenterY / distanceFromCenter;
-        const radialDirZ = toCenterZ / distanceFromCenter;
+        const altitude = distanceFromCenter - R;
 
-        // Calculate surface alignment (how perpendicular surface is to radius)
-        const surfaceAlignment = Math.abs(nx * radialDirX + ny * radialDirY + nz * radialDirZ);
-        
-        // Calculate slope (0 = flat relative to planet, 1 = vertical cliff)
-        const slope = 1.0 - surfaceAlignment;
-        
-        // Calculate altitude relative to planet surface
-        const altitude = distanceFromCenter - MaterialSystem.PLANET_RADIUS;
-        
-        // Calculate latitude-like effect
-        const latitudeFactor = Math.abs(y) / MaterialSystem.PLANET_RADIUS;
+        // Normalize altitude to [0,1] based on noise range
+        const altitudeNorm = (altitude + N/2) / N;
 
-        // Material assignment (exact same logic as fragment shader)
-        
-        // ROCK: Steep slopes and high altitude areas
-        let rockWeight = MaterialSystem.smoothstep(0.25, 0.6, slope) + 
-                        MaterialSystem.smoothstep(10.0, 20.0, altitude) * 0.9 +
-                        MaterialSystem.smoothstep(0.6, 0.8, latitudeFactor) * 0.6;
-        
-        // GRASS: Flat areas at moderate altitude
-        let grassWeight = MaterialSystem.smoothstep(0.7, 0.3, slope) * 
-                         MaterialSystem.smoothstep(-2.0, 12.0, altitude) * 
-                         MaterialSystem.smoothstep(0.7, 0.2, latitudeFactor) * 
-                         MaterialSystem.smoothstep(15.0, 5.0, altitude);
-        
-        // DIRT: Medium slopes and transition zones
-        let dirtWeight = MaterialSystem.smoothstep(0.15, 0.5, slope) * 
-                        MaterialSystem.smoothstep(0.5, 0.15, slope) * 
-                        MaterialSystem.smoothstep(-8.0, 25.0, altitude) +
-                        MaterialSystem.smoothstep(0.4, 0.7, slope) * 
-                        MaterialSystem.smoothstep(0.7, 0.4, slope) * 0.3;
-        
-        // SAND: Coastal areas with smooth transitions
-        const seaLevelFactor = MaterialSystem.smoothstep(5.0, -3.0, altitude) * 
-                              MaterialSystem.smoothstep(-3.0, -10.0, altitude);
-        const flatFactor = MaterialSystem.smoothstep(0.5, 0.05, slope);
-        const coastalFactor = MaterialSystem.smoothstep(0.6, 0.15, latitudeFactor);
-        
-        let sandWeight = seaLevelFactor * flatFactor * coastalFactor * 0.7;
+        const radialDirX = -toCenterX / distanceFromCenter;
+        const radialDirY = -toCenterY / distanceFromCenter;
+        const radialDirZ = -toCenterZ / distanceFromCenter;
+        const surfaceAlignment = nx * radialDirX + ny * radialDirY + nz * radialDirZ;
+        const slope = 1.0 - Math.abs(surfaceAlignment);
 
-        // Add noise variation for natural look
-        const noise1 = Math.sin(x * 0.04) * Math.sin(z * 0.04) * 0.25 + 0.75;
-        const noise2 = Math.sin(x * 0.07 + 50.0) * Math.sin(y * 0.07) * 0.2 + 0.8;
-        const noise3 = Math.sin(x * 0.03) * Math.sin(z * 0.03) * 0.3 + 0.7;
+        // Noisy thresholds for bubbly transitions
+        const sandNoise = this.noise(x, y, z, 0.035, 1234) * 0.10 - 0.05;
+        const grassNoise = this.noise(x, y, z, 0.045, 5678) * 0.10 - 0.05;
+        const dirtNoise = this.noise(x, y, z, 0.027, 91011) * 0.10 - 0.05;
 
-        // Apply noise to create natural variation
-        grassWeight *= noise1;
-        dirtWeight *= noise2;
-        rockWeight *= noise3;
+        // Minimal noise for blending
+        const blendNoise = 0.99 + 0.01 * Math.sin(x * 0.01 + z * 0.01);
 
-        // Sand gets smoother noise treatment
-        const sandNoise = Math.sin(x * 0.02) * Math.sin(z * 0.02) * 0.4 + 0.6;
-        sandWeight *= sandNoise;
+        // SAND: only at low altitude, fades out quickly above sea level, with noisy transition
+        let sand = this.smoothstep(0.10 + sandNoise, 0.03 + sandNoise, altitudeNorm) * this.smoothstep(0.0, 0.18, slope);
 
-        // Add random rock outcrops
-        const rockPatchNoise = Math.sin(x * 0.015) * Math.sin(y * 0.015) * Math.sin(z * 0.015);
-        const rockOutcrop = MaterialSystem.smoothstep(0.7, 0.8, rockPatchNoise);
-        rockWeight += rockOutcrop * 0.4;
-        sandWeight *= (1.0 - rockOutcrop * 0.8);
+        // ROCK: only on very steep slopes, above sand, with noisy transition
+        let rock = (1.0 - sand) * this.smoothstep(0.38 + dirtNoise, 0.50 + dirtNoise, slope);
 
-        // Smooth altitude-based sand reduction
-        sandWeight *= MaterialSystem.smoothstep(8.0, 3.0, altitude);
+        // GRASS: dominates nearly all non-steep, non-sandy areas, with noisy transition
+        let grass =
+            (1.0 - sand) *
+            this.smoothstep(0.10 + grassNoise, 0.93 + grassNoise, altitudeNorm) *
+            this.smoothstep(0.0, 0.48, slope) *
+            (1.0 - this.smoothstep(0.97, 1.0, altitudeNorm));
 
-        // Add subtle blending between materials
-        const blendStrength = 0.15;
-        const avgWeight = (rockWeight + grassWeight + dirtWeight) / 3.0;
-        rockWeight = MaterialSystem.mix(rockWeight, avgWeight, blendStrength * 0.3);
-        grassWeight = MaterialSystem.mix(grassWeight, avgWeight, blendStrength * 0.4);
-        dirtWeight = MaterialSystem.mix(dirtWeight, avgWeight, blendStrength * 0.5);
+        grass = Math.pow(grass, 0.07);
 
-        // Ensure minimum material presence
-        rockWeight = Math.max(rockWeight, 0.08);
-        grassWeight = Math.max(grassWeight, 0.04);
-        dirtWeight = Math.max(dirtWeight, 0.08);
-        sandWeight = Math.max(sandWeight, 0.01);
+        // DIRT: buffer between grass and rock, always smoothly blended, but clamp to a very small minimum
+        let dirt = 1.0 - sand - grass - rock;
+        dirt = Math.max(Math.min(dirt, 0.15), 0.001);
 
-        // Normalize weights
-        const total = rockWeight + grassWeight + dirtWeight + sandWeight;
-        if (total > 0.001) {
-            return {
-                rock: rockWeight / total,
-                grass: grassWeight / total,
-                dirt: dirtWeight / total,
-                sand: sandWeight / total
-            };
-        } else {
-            return { rock: 0.4, grass: 0.3, dirt: 0.3, sand: 0.0 };
-        }
+        // Add a little blending noise to grass/dirt, but not sand/rock
+        grass *= blendNoise;
+        dirt *= blendNoise * 1.01;
+
+        sand = Math.max(sand, 0.001);
+        grass = Math.max(grass, 0.001);
+        rock = Math.max(rock, 0.001);
+
+        // Normalize
+        const total = sand + grass + dirt + rock;
+        return {
+            sand: sand / total,
+            grass: grass / total,
+            dirt: dirt / total,
+            rock: rock / total
+        };
     }
 
-    // Utility functions
     private static smoothstep(edge0: number, edge1: number, x: number): number {
         const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
         return t * t * (3 - 2 * t);
-    }
-
-    private static mix(a: number, b: number, t: number): number {
-        return a + (b - a) * t;
-    }
-
-    public static calculateTriplanarWeights(normal: [number, number, number]): [number, number, number] {
-        const [nx, ny, nz] = normal;
-        let absX = Math.abs(nx);
-        let absY = Math.abs(ny);
-        let absZ = Math.abs(nz);
-        
-        // Use power 4 for soft blending
-        absX = Math.pow(absX, 4.0);
-        absY = Math.pow(absY, 4.0);
-        absZ = Math.pow(absZ, 4.0);
-        
-        const sum = absX + absY + absZ;
-        if (sum > 0.001) {
-            return [absX / sum, absY / sum, absZ / sum];
-        } else {
-            return [0, 1, 0]; // Default to Y-axis
-        }
     }
 }

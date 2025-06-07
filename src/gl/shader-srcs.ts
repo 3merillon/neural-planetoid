@@ -17,11 +17,7 @@ void main(void) {
     vertex_material_weights = material_weights;
     
     vec4 clip_pos = proj_view * vec4(pos, 1.0);
-    
-    if (lod_level > 0) {
-        float bias = z_bias_factor * float(lod_level);
-        clip_pos.z -= bias * clip_pos.w;
-    }
+    clip_pos.z -= z_bias_factor * clip_pos.w;
     
     gl_Position = clip_pos;
 }`;
@@ -36,9 +32,17 @@ uniform vec3 sun_direction;
 uniform bool use_smooth_shading;
 uniform vec3 lod_color;
 uniform int lod_level;
+
+// Overlapping fade uniforms
+uniform float fade_in_start;
+uniform float fade_in_end;
+uniform float fade_out_start;
+uniform float fade_out_end;
+
+// Legacy fade uniforms (for compatibility)
 uniform float fade_near;
 uniform float fade_far;
-uniform bool enable_dithering;
+
 uniform int max_lod_level;
 uniform highp sampler2DArray material_diffuse;
 uniform highp sampler2DArray material_normals;  
@@ -49,16 +53,14 @@ uniform bool enable_triplanar;
 
 in vec3 vpos;
 in vec3 vnormal;
-in vec4 vertex_material_weights; // rock, grass, dirt, sand
+in vec4 vertex_material_weights;
 
 out vec4 color;
 
-// Convert sRGB to linear for proper lighting calculations
 vec3 srgb_to_linear(vec3 c) {
     return pow(c, vec3(2.2));
 }
 
-// Triplanar blending weights
 vec3 calculate_triplanar_weights(vec3 normal) {
     vec3 abs_normal = abs(normal);
     abs_normal = pow(abs_normal, vec3(4.0));
@@ -66,13 +68,12 @@ vec3 calculate_triplanar_weights(vec3 normal) {
     return sum > 0.001 ? abs_normal / sum : vec3(0.0, 1.0, 0.0);
 }
 
-// Triplanar diffuse sampling - using vertex materials
 vec3 triplanar_diffuse_multi(vec3 world_pos, vec3 world_normal, float scale, vec4 material_weights) {
     vec3 blend_weights = calculate_triplanar_weights(world_normal);
     vec3 final_color = vec3(0.0);
     
     for(int i = 0; i < 4; i++) {
-        if(material_weights[i] > 0.05) { // Skip materials with low contribution
+        if(material_weights[i] > 0.05) {
             vec3 color_x = texture(material_diffuse, vec3(world_pos.zy * scale, float(i))).rgb;
             vec3 color_y = texture(material_diffuse, vec3(world_pos.xz * scale, float(i))).rgb;
             vec3 color_z = texture(material_diffuse, vec3(world_pos.xy * scale, float(i))).rgb;
@@ -88,13 +89,12 @@ vec3 triplanar_diffuse_multi(vec3 world_pos, vec3 world_normal, float scale, vec
     return final_color;
 }
 
-// Triplanar normal sampling
 vec3 triplanar_normal_multi(vec3 world_pos, vec3 world_normal, float scale, vec4 material_weights) {
     vec3 blend_weights = calculate_triplanar_weights(world_normal);
     vec3 final_normal = vec3(0.0);
     
     for(int i = 0; i < 4; i++) {
-        if(material_weights[i] > 0.05) { // Skip materials with low contribution
+        if(material_weights[i] > 0.05) {
             vec3 normal_x = texture(material_normals, vec3(world_pos.zy * scale, float(i))).xyz * 2.0 - 1.0;
             vec3 normal_y = texture(material_normals, vec3(world_pos.xz * scale, float(i))).xyz * 2.0 - 1.0;
             vec3 normal_z = texture(material_normals, vec3(world_pos.xy * scale, float(i))).xyz * 2.0 - 1.0;
@@ -138,13 +138,12 @@ vec3 triplanar_normal_multi(vec3 world_pos, vec3 world_normal, float scale, vec4
     return normalize(mix(world_normal, final_normal, 0.8));
 }
 
-// Triplanar roughness sampling
 float triplanar_roughness_multi(vec3 world_pos, vec3 world_normal, float scale, vec4 material_weights) {
     vec3 blend_weights = calculate_triplanar_weights(world_normal);
     float final_roughness = 0.0;
     
     for(int i = 0; i < 4; i++) {
-        if(material_weights[i] > 0.05) { // Skip materials with low contribution
+        if(material_weights[i] > 0.05) {
             float roughness_x = texture(material_roughness, vec3(world_pos.zy * scale, float(i))).r;
             float roughness_y = texture(material_roughness, vec3(world_pos.xz * scale, float(i))).r;
             float roughness_z = texture(material_roughness, vec3(world_pos.xy * scale, float(i))).r;
@@ -175,61 +174,92 @@ float getBayerValue(ivec2 coord) {
 }
 
 void main(void) {
-    // Early fragment culling
     float distance_to_camera = length(eye_pos - vpos);
     
-    // Discard fragments that are too far away
-    if (distance_to_camera > fade_far * 2.0) discard;
-    
-    // Discard LOD > 0 fragments that are too close
-    if (lod_level > 0 && distance_to_camera < fade_near * 0.5) discard;
-
-    // LOD fade dithering using pre-calculated distance
-    if (enable_dithering) {
+    // NEW: More sophisticated fade logic that allows overlapping
+        float dither_threshold = getBayerValue(ivec2(gl_FragCoord.xy));
         bool should_discard = false;
-        if (lod_level == 0) {
-            if (distance_to_camera > fade_near) {
-                float fade_factor = clamp((distance_to_camera - fade_near) / (fade_far - fade_near), 0.0, 1.0);
-                float dither_threshold = getBayerValue(ivec2(gl_FragCoord.xy));
-                if (fade_factor > dither_threshold) {
+        
+        // Validate fade distances
+        bool has_valid_fade_in = (fade_in_end > fade_in_start) && (fade_in_start >= 0.0);
+        bool has_valid_fade_out = (fade_out_end > fade_out_start) && (fade_out_start > 0.0);
+        
+        if (lod_level == max_lod_level) {
+            // FINEST LOD: Only fades out, allows coarser LODs to show through
+            if (has_valid_fade_out && distance_to_camera > fade_out_start) {
+                if (distance_to_camera > fade_out_end) {
                     should_discard = true;
+                } else {
+                    float fade_out_progress = (distance_to_camera - fade_out_start) / (fade_out_end - fade_out_start);
+                    float visibility = 1.0 - clamp(fade_out_progress, 0.0, 1.0);
+                    
+                    // NEW: Use smoother dithering pattern for better transitions
+                    float smooth_dither = smoothstep(0.0, 1.0, dither_threshold);
+                    if (visibility < smooth_dither) {
+                        should_discard = true;
+                    }
                 }
             }
-        } else {
-            float fade_in_end = fade_near * 1.11;
-            if (distance_to_camera < fade_near) {
-                should_discard = true;
-            } else if (distance_to_camera < fade_in_end) {
-                float fade_in_progress = (distance_to_camera - fade_near) / (fade_in_end - fade_near);
-                float fade_in_factor = 1.0 - fade_in_progress;
-                float dither_threshold = getBayerValue(ivec2(gl_FragCoord.xy));
-                if (fade_in_factor > dither_threshold) {
+            
+        } else if (lod_level == 0) {
+            // COARSEST LOD: Only fades in at far distances
+            if (has_valid_fade_in && distance_to_camera < fade_in_end) {
+                if (distance_to_camera < fade_in_start) {
                     should_discard = true;
+                } else {
+                    float fade_in_progress = (distance_to_camera - fade_in_start) / (fade_in_end - fade_in_start);
+                    float visibility = clamp(fade_in_progress, 0.0, 1.0);
+                    
+                    float smooth_dither = smoothstep(0.0, 1.0, dither_threshold);
+                    if (visibility < smooth_dither) {
+                        should_discard = true;
+                    }
                 }
-            } else if (distance_to_camera > fade_far) {
-                float fade_out_end = fade_far * 1.15;
-                if (lod_level < max_lod_level || distance_to_camera > fade_out_end * 0.8) {
-                    float fade_out_progress = (distance_to_camera - fade_far) / (fade_out_end - fade_far);
-                    float fade_out_factor = clamp(fade_out_progress, 0.0, 1.0);
-                    float dither_threshold = getBayerValue(ivec2(gl_FragCoord.xy));
-                    if (fade_out_factor > dither_threshold) {
+            }
+            
+        } else {
+            // MIDDLE LODs: Both fade in and fade out, creating overlap zones
+            
+            // Fade in logic - becomes visible as camera moves away
+            if (has_valid_fade_in && distance_to_camera < fade_in_end) {
+                if (distance_to_camera < fade_in_start) {
+                    should_discard = true;
+                } else {
+                    float fade_in_progress = (distance_to_camera - fade_in_start) / (fade_in_end - fade_in_start);
+                    float visibility = clamp(fade_in_progress, 0.0, 1.0);
+                    
+                    float smooth_dither = smoothstep(0.0, 1.0, dither_threshold);
+                    if (visibility < smooth_dither) {
+                        should_discard = true;
+                    }
+                }
+            }
+            
+            // Fade out logic - becomes invisible as camera moves further away
+            if (!should_discard && has_valid_fade_out && distance_to_camera > fade_out_start) {
+                if (distance_to_camera > fade_out_end) {
+                    should_discard = true;
+                } else {
+                    float fade_out_progress = (distance_to_camera - fade_out_start) / (fade_out_end - fade_out_start);
+                    float visibility = 1.0 - clamp(fade_out_progress, 0.0, 1.0);
+                    
+                    float smooth_dither = smoothstep(0.0, 1.0, dither_threshold);
+                    if (visibility < smooth_dither) {
                         should_discard = true;
                     }
                 }
             }
         }
+        
         if (should_discard) discard;
-    }
 
-    // Material sampling and lighting using vertex materials
+    // Material sampling and lighting
     vec3 base_color;
     vec3 surface_normal;
     float roughness;
     
     if (enable_triplanar) {
         float texture_scale = 0.1;
-        
-        // Use vertex material weights directly
         base_color = triplanar_diffuse_multi(vpos, normalize(vnormal), texture_scale, vertex_material_weights);
         surface_normal = triplanar_normal_multi(vpos, normalize(vnormal), texture_scale, vertex_material_weights);
         roughness = triplanar_roughness_multi(vpos, normalize(vnormal), texture_scale, vertex_material_weights);
@@ -239,7 +269,6 @@ void main(void) {
         roughness = 0.5;
     }
     
-    // Apply LOD tinting if enabled
     if (tint_lod_levels) {
         float tint_strength = 0.25;
         base_color = mix(base_color, lod_color, tint_strength);
@@ -254,7 +283,6 @@ void main(void) {
     float n_dot_h = max(dot(surface_normal, half_dir), 0.0);
     float n_dot_v = max(dot(surface_normal, view_dir), 0.0);
     
-    // Lighting with roughness
     vec3 ambient = base_color * 0.01;
     vec3 diffuse = base_color * 0.99 * n_dot_l;
     

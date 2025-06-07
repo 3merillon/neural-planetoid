@@ -13,7 +13,7 @@ export class AudioManager {
         const config: MusicConfig = {
             seed: seed,
             volume: 0.3,
-            tempo: 75 + Math.floor((seed % 1000) / 10), // Tempo varies with seed
+            tempo: 75 + Math.floor((seed % 1000) / 10),
             key: 'A',
             scale: this.getScaleFromSeed(seed)
         };
@@ -28,7 +28,7 @@ export class AudioManager {
     }
 
     private getScaleFromSeed(seed: number): 'minor' | 'dorian' | 'phrygian' | 'mixolydian' | 'pentatonic' | 'blues' {
-        const scales: Array<'minor' | 'dorian' | 'phrygian' | 'mixolydian' | 'pentatonic' | 'blues'> = 
+        const scales: Array<'minor' | 'dorian' | 'phrygian' | 'mixolydian' | 'pentatonic' | 'blues'> =
             ['minor', 'dorian', 'phrygian', 'mixolydian', 'pentatonic', 'blues'];
         return scales[seed % scales.length];
     }
@@ -38,13 +38,9 @@ export class AudioManager {
             this.pendingStart = true;
             return;
         }
-
         try {
             await this.musicGenerator.start();
-            //console.log('Enhanced procedural music started');
-        } catch (error) {
-            //console.warn('Failed to start music:', error);
-        }
+        } catch (error) {}
     }
 
     public stopMusic(): void {
@@ -65,7 +61,6 @@ export class AudioManager {
 
     public setSeed(seed: number): void {
         if (this.musicGenerator) {
-            // Update tempo based on seed
             const newTempo = 75 + Math.floor((seed % 1000) / 10);
             this.musicGenerator.setTempo(newTempo);
             this.musicGenerator.setSeed(seed);
